@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
 #pragma once
@@ -69,6 +69,12 @@ public:
 	void EnableFpuFullMode();
 	void EnableFpuMulHack();
 
+	// Turns OFF the (default-ON) fpuGuardedAddSub Recompiler option so the JIT
+	// emits a plain single-precision add/sub with no guard-bit masking — the
+	// opt-out perf path. Off makes the JIT bit-identical to the single-precision
+	// interpreter (which never masks). Restored to its previous value in the dtor.
+	void DisableFpuGuarded();
+
 	// ---- Memory ----
 
 	void WriteU8 (u32 addr, u8  value);
@@ -100,7 +106,9 @@ public:
 	// ---- Program load ----
 
 	void LoadProgram(std::initializer_list<u32> instructions);
+	void LoadProgram(const std::vector<u32>& instructions);
 	void LoadProgramNoTerm(std::initializer_list<u32> instructions);
+	void LoadProgramNoTerm(const std::vector<u32>& instructions);
 
 	// ---- Execute ----
 
@@ -341,6 +349,8 @@ private:
 	bool prev_fpu_full_mode_ = false;
 	bool fpu_mul_hack_changed_ = false;
 	bool prev_fpu_mul_hack_ = false;
+	bool fpu_guarded_changed_ = false;
+	bool prev_fpu_guarded_ = false;
 };
 
 } // namespace recompiler_tests

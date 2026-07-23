@@ -473,6 +473,7 @@ Pcsx2Config::RecompilerOptions::RecompilerOptions()
 	fpuOverflow = true;
 	//fpuExtraOverflow = false;
 	//fpuFullMode = false;
+	fpuGuardedAddSub = true; // PS2-accurate add/sub guard-bit emulation; opt-out for perf on titles verified not to need it.
 }
 
 void Pcsx2Config::RecompilerOptions::ApplySanityCheck()
@@ -551,6 +552,7 @@ void Pcsx2Config::RecompilerOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(fpuOverflow);
 	SettingsWrapBitBool(fpuExtraOverflow);
 	SettingsWrapBitBool(fpuFullMode);
+	SettingsWrapBitBool(fpuGuardedAddSub);
 }
 
 u32 Pcsx2Config::RecompilerOptions::GetEEClampMode() const
@@ -876,6 +878,7 @@ bool Pcsx2Config::GSOptions::OptionsAreEqual(const GSOptions& right) const
 		OpEqu(UserHacks_BilinearHack) &&
 		OpEqu(OverrideTextureBarriers) &&
 		OpEqu(DepthFeedbackMode) &&
+		OpEqu(BackThreadMode) &&
 
 		OpEqu(CAS_Sharpness) &&
 		OpEqu(ShadeBoost_Brightness) &&
@@ -929,6 +932,7 @@ bool Pcsx2Config::GSOptions::RestartOptionsAreEqual(const GSOptions& right) cons
 		   OpEqu(DisableVertexShaderExpand) &&
 		   OpEqu(OverrideTextureBarriers) &&
 		   OpEqu(DepthFeedbackMode) &&
+		   OpEqu(BackThreadMode) &&
 		   OpEqu(HWAA1) &&
 		   OpEqu(ExclusiveFullscreenControl);
 }
@@ -1095,6 +1099,7 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapIntEnumEx(TriFilter, "TriFilter");
 	SettingsWrapBitfieldEx(OverrideTextureBarriers, "OverrideTextureBarriers");
 	SettingsWrapIntEnumEx(DepthFeedbackMode, "DepthFeedbackMode");
+	SettingsWrapIntEnumEx(BackThreadMode, "GSBackThreadMode");
 
 	SettingsWrapBitfield(ShadeBoost_Brightness);
 	SettingsWrapBitfield(ShadeBoost_Contrast);

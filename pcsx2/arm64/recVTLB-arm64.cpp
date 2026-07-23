@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
 // ARM64 EE VTLB Dynamic Code Generation
@@ -227,6 +227,13 @@ static void vtlbGetLiveRegisterMasks(u32& gpr_bitmask, u32& fpr_bitmask)
 		if (arm64neon[i].inuse)
 			fpr_bitmask |= (1u << i);
 	}
+
+	// SL-13: the q25/q26 clamp-constant broadcasts are not allocator state,
+	// but when compile-time valid they must survive a backpatched slowmem
+	// thunk's C call like any live register — clamp sites after this access
+	// were compiled without re-materialization.
+	if (cop2ClampConstsValid())
+		fpr_bitmask |= (1u << NEON_RESERVED_COP2_CLAMPMAX) | (1u << NEON_RESERVED_COP2_CLAMPMIN);
 }
 
 // Emit a single fastmem load instruction and register backpatch info.
@@ -390,7 +397,7 @@ static void recStoreLoadResult(const a64::Register& result = a64::x0)
 	{
 		_deleteEEreg(_Rt_, 0);
 		GPR_DEL_CONST(_Rt_);
-		armStoreEERegPtr(result, &cpuRegs.GPR.r[_Rt_].UD[0]);
+		_eeStoreGPRDestReg(_Rt_, result);
 	}
 }
 
@@ -670,14 +677,10 @@ static bool recStoreConstPaddrMMIOShortcut(u32 bits)
 		case 64: szidx = 3; break;
 	}
 
-	// AAPCS64: w0 = paddr, w1/x1 = value. After FLUSH_INTERPRETER (0xfff)
-	// all guest reg state is in memory, so armLoadEERegPtr is correct for
-	// both const and non-const Rt (including Rt == 0).
+	// AAPCS64: w0 = paddr, w1/x1 = value. _eeMoveGPRtoR reads Rt from its
+	// coherent home (const / resident slot / pin / memory), handling Rt == 0.
 	armAsm->Mov(a64::w0, paddr);
-	if (bits <= 32)
-		armLoadEERegPtr(a64::w1, &cpuRegs.GPR.r[_Rt_].UL[0]);
-	else
-		armLoadEERegPtr(a64::x1, &cpuRegs.GPR.r[_Rt_].UD[0]);
+	_eeMoveGPRtoR(bits <= 32 ? a64::w1 : a64::x1, _Rt_);
 
 	// RECCYCLE coherence — same rationale as recLoadConstPaddrMMIOShortcut.
 	armFlushCycleDelta();
@@ -965,10 +968,14 @@ void recSQ()
 	// not written back by FLUSH_CONSTANT_REGS — relies on allocator
 	// preferring NEON for full-128-bit guest GPRs.
 	iFlushCall(FLUSH_CONSTANT_REGS);
-	armLoadEERegPtr(a64::q0, &cpuRegs.GPR.r[_Rt_].UQ);
-	armMergeEEPinIntoQuad(a64::q0, _Rt_); // lazy-dirty: stale lower half
+	// Raw quad load (bypasses the scalar tripwire): the lower half is
+	// intentionally stale-then-merged below for a dirty pin OR scalar slot.
+	armLoadEERegPtrRaw(a64::q0, &cpuRegs.GPR.r[_Rt_].UQ);
+	armMergeEEResidentIntoQuad(a64::q0, _Rt_); // lazy-dirty / residency merge
 
-	armLoadEERegPtr(a64::w9, &cpuRegs.GPR.r[_Rs_].UL[0]);
+	// Rs address read must hit its resident slot: FLUSH_CONSTANT_REGS does NOT
+	// free the callee-saved x28 pool slot, so a raw memory load could go stale.
+	_eeMoveGPRtoR(a64::w9, _Rs_);
 	if (_Imm_ != 0)
 		armAsm->Add(a64::w9, a64::w9, _Imm_);
 	armAsm->And(a64::w9, a64::w9, (u32)~0xF);
@@ -1059,6 +1066,36 @@ void recSWC1()
 //  (no C call on the fast path), avoiding a full FLUSH_INTERPRETER eviction.
 // =====================================================================================================
 
+// Resolve Rt's 64-bit read-modify-write home for the unaligned-load merges.
+//
+// A pinned Rt must NOT get an allocator slot (GE-M2 I1): under the
+// resident-ALU templates the slot persists past this op, and pin-preferring
+// readers (_eeGetGPRSourceReg — every scalar-template ALU consumer) keep
+// serving the PRE-load mirror value until the next seam writes the slot back
+// through the pin (the UYA unaligned-load corruption, 2026-07-17). Instead the
+// merge targets the pin itself: it already holds the current lower 64 (a live
+// 128-bit home or pending const is reconciled into it first), and under
+// lazy-dirty writing the pin IS the guest write — every seam flushes all pins.
+//
+// Unpinned Rt keeps the allocator slot. MODE_READ|MODE_WRITE (not WRITE-only)
+// for both the fill (the merge's old-value bits) and the prior-dual-residence
+// reconciliation — see the fusion-path comment below (the Black boot hang).
+static vixl::aarch64::Register eeUnalignedRtWriteHome()
+{
+	if (const a64::Register* pin = armEEPinForGPR(_Rt_))
+	{
+		// A live 128-bit home is authoritative over the pin; its writeback
+		// (armStoreEEGPRQuad) refreshes lane 0 into the mirror. A pending
+		// const materializes into the pin via _flushConstReg.
+		_deleteGPRtoNEONreg(_Rt_, DELETE_REG_FREE);
+		if (GPR_IS_CONST1(_Rt_))
+			_flushConstReg(_Rt_);
+		GPR_DEL_CONST(_Rt_);
+		return *pin;
+	}
+	return armXRegister(_allocArm64GPR(ARM64TYPE_GPR, _Rt_, MODE_READ | MODE_WRITE));
+}
+
 // Inline LWL/LWR codegen. Mirrors x86 recLWL/recLWR (ix86-32/iR5900LoadStore.cpp).
 //
 //   addr    = Rs + imm
@@ -1116,14 +1153,14 @@ static void recUnalignedWord(bool is_lwl)
 
 	armAsm->Mov(armWRegister(memTemp), a64::w0);                       // park loaded (x0 unsafe across Rt alloc)
 
-	const int rt = _allocArm64GPR(ARM64TYPE_GPR, _Rt_, MODE_READ | MODE_WRITE);
+	const a64::Register rt = eeUnalignedRtWriteHome();
 
 	if (is_lwl)
 	{
 		// mask = 0xffffff >> shift8
 		armAsm->Mov(RWSCRATCH, 0xffffff);
 		armAsm->Lsr(RWSCRATCH, RWSCRATCH, armWRegister(shift8));
-		armAsm->And(armWRegister(rt), armWRegister(rt), RWSCRATCH);
+		armAsm->And(rt.W(), rt.W(), RWSCRATCH);
 
 		// shifted_loaded = loaded << (24 - shift8); reuse RWSCRATCH as shift amount.
 		armAsm->Mov(RWSCRATCH, 24);
@@ -1131,8 +1168,8 @@ static void recUnalignedWord(bool is_lwl)
 		armAsm->Lsl(armWRegister(memTemp), armWRegister(memTemp), RWSCRATCH);
 
 		// Merge and sign-extend the 32-bit result into the 64-bit guest reg.
-		armAsm->Orr(armWRegister(rt), armWRegister(rt), armWRegister(memTemp));
-		armAsm->Sxtw(armXRegister(rt), armWRegister(rt));
+		armAsm->Orr(rt.W(), rt.W(), armWRegister(memTemp));
+		armAsm->Sxtw(rt, rt.W());
 	}
 	else
 	{
@@ -1144,18 +1181,18 @@ static void recUnalignedWord(bool is_lwl)
 		armAsm->Sub(RWSCRATCH, RWSCRATCH, armWRegister(shift8));
 		armAsm->Mov(RSCRATCHADDR.W(), 0xffffff00u);
 		armAsm->Lsl(RSCRATCHADDR.W(), RSCRATCHADDR.W(), RWSCRATCH);
-		armAsm->And(RWSCRATCH, armWRegister(rt), RSCRATCHADDR.W());
+		armAsm->And(RWSCRATCH, rt.W(), RSCRATCHADDR.W());
 
 		armAsm->Lsr(armWRegister(memTemp), armWRegister(memTemp), armWRegister(shift8));
 		armAsm->Orr(armWRegister(memTemp), armWRegister(memTemp), RWSCRATCH);
 
 		// Per interp: when shift8 != 0, only Rt[31:0] changes; upper 32 preserved.
-		armAsm->Bfi(armXRegister(rt), armXRegister(memTemp), 0, 32);
+		armAsm->Bfi(rt, armXRegister(memTemp), 0, 32);
 		armAsm->B(&done);
 
 		// shift8 == 0 (aligned): straight sign-extend, full 64-bit overwrite.
 		armAsm->Bind(&nomask);
-		armAsm->Sxtw(armXRegister(rt), armWRegister(memTemp));
+		armAsm->Sxtw(rt, armWRegister(memTemp));
 
 		armAsm->Bind(&done);
 	}
@@ -1309,8 +1346,8 @@ static void recUnalignedLoadDouble(bool is_ldl)
 			const int memTemp = _allocArm64GPR(ARM64TYPE_TEMP, 0, 0);
 			vtlbFastmemRead(9, 0, 64, false);                 // mem -> x0
 			armAsm->Mov(armXRegister(memTemp), a64::x0);       // park (x0 unsafe across Rt alloc)
-			const int rt = _allocArm64GPR(ARM64TYPE_GPR, _Rt_, MODE_READ | MODE_WRITE);
-			armAsm->Mov(armXRegister(rt), armXRegister(memTemp));
+			const a64::Register rt = eeUnalignedRtWriteHome();
+			armAsm->Mov(rt, armXRegister(memTemp));
 			_freeArm64GPR(memTemp);
 			g_eeUnalignedFused = true;
 			g_eeUnalignedFuseCount++;
@@ -1345,7 +1382,7 @@ static void recUnalignedLoadDouble(bool is_ldl)
 
 	armAsm->Mov(armXRegister(memTemp), a64::x0);                       // park mem (x0 unsafe across Rt alloc)
 
-	const int rt = _allocArm64GPR(ARM64TYPE_GPR, _Rt_, MODE_READ | MODE_WRITE);
+	const a64::Register rt = eeUnalignedRtWriteHome();
 
 	a64::Label special, done;
 	armAsm->Cmp(armWRegister(sTemp), is_ldl ? 7 : 0);
@@ -1363,7 +1400,7 @@ static void recUnalignedLoadDouble(bool is_ldl)
 		armAsm->Add(RXSCRATCH, RXSCRATCH, 8);                         // shift8 + 8
 		armAsm->Mov(RSCRATCHADDR, UINT64_C(0xFFFFFFFFFFFFFFFF));
 		armAsm->Lsr(RSCRATCHADDR, RSCRATCHADDR, RXSCRATCH);
-		armAsm->And(armXRegister(rt), armXRegister(rt), RSCRATCHADDR);
+		armAsm->And(rt, rt, RSCRATCHADDR);
 	}
 	else
 	{
@@ -1375,14 +1412,14 @@ static void recUnalignedLoadDouble(bool is_ldl)
 		// mask: Rt & (~0 << (64 - shift8))
 		armAsm->Mov(RXSCRATCH, UINT64_C(0xFFFFFFFFFFFFFFFF));
 		armAsm->Lsl(RXSCRATCH, RXSCRATCH, RSCRATCHADDR);
-		armAsm->And(armXRegister(rt), armXRegister(rt), RXSCRATCH);
+		armAsm->And(rt, rt, RXSCRATCH);
 	}
 
-	armAsm->Orr(armXRegister(rt), armXRegister(rt), armXRegister(memTemp));
+	armAsm->Orr(rt, rt, armXRegister(memTemp));
 	armAsm->B(&done);
 
 	armAsm->Bind(&special);
-	armAsm->Mov(armXRegister(rt), armXRegister(memTemp));              // Rt = mem
+	armAsm->Mov(rt, armXRegister(memTemp));                            // Rt = mem
 
 	armAsm->Bind(&done);
 	_freeArm64GPR(memTemp);
@@ -1562,28 +1599,38 @@ void recLQC2()
 	// save/reload, runtime VPU_STAT check, and cycle accounting.
 	cop2EmitConditionalSync(false, _vu0FinishMicro);
 
-	// addr = (rs + imm) & ~0xF
+	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+
+	// S4-3 fastmem path: no iFlushCall — the allocator (caller-saved scalar
+	// GPRs, FPRC, NEON quads/FPRs) rides through, matching the GE-14 recLQ
+	// shape. Address before the const flush (keeps the const-Rs fold); only
+	// constants must be memory-visible for the fault-path C handler. The
+	// quad lands in RQSCRATCH (q30) — per-op scratch, never allocator-
+	// tracked, so no q0 detach is needed — and is stored to VU0.VF[ft]
+	// directly (ft's memory is current here: LQC2 is VF-cache-classifier-
+	// false, so recompileNextInstruction flushed the COP2 VF compile cache
+	// before this emitter ran, and VF regs are never EE-allocator-tracked).
+	if (useFastmem)
+	{
+		recComputeAddr();
+		armAsm->And(a64::w9, a64::w9, (u32)~0xF);
+		_flushConstRegs(true);
+		vtlbFastmemRead128(9, RQSCRATCH.GetCode());
+		if (_Rt_)
+			armAsm->Str(RQSCRATCH, armVU0Mem(&VU0.VF[_Rt_]));
+		return;
+	}
+
+	// Softmem: addr = (rs + imm) & ~0xF, then the legacy full-flush + q0
+	// shape (the C call clobbers caller-saved state anyway).
 	recComputeAddr();
 	armAsm->And(a64::w9, a64::w9, (u32)~0xF);
-
-	// Match recLQ/recSQ: spill constant tracking before the softmem C call
-	// can fire (vtlb_memRead128 may dispatch through an MMIO handler that
-	// reads cpuRegs). Redundant when cop2EmitConditionalSync already
-	// emitted FLUSH_INTERPRETER, harmless otherwise.
 	iFlushCall(FLUSH_CONSTANT_REGS);
-
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
-	if (useFastmem)
-		vtlbFastmemRead128(9, 0);
-	else
-		vtlbSoftmemRead128(9);
+	vtlbSoftmemRead128(9);
 
 	// Store 128-bit result to VU0.VF[rt] (COP2 ft field = rt field)
 	if (_Rt_)
-	{
-		armMoveAddressToReg(RSCRATCHADDR, &VU0.VF[_Rt_].UQ);
-		armAsm->Str(a64::q0, a64::MemOperand(RSCRATCHADDR));
-	}
+		armAsm->Str(a64::q0, armVU0Mem(&VU0.VF[_Rt_]));
 }
 
 void recSQC2()
@@ -1591,8 +1638,24 @@ void recSQC2()
 	// EEINST-gated VU0 sync — see recLQC2 above.
 	cop2EmitConditionalSync(false, _vu0FinishMicro);
 
-	// addr = (rs + imm) & ~0xF — allocator-aware (rs may still be live
-	// in a host reg if the sync above emitted nothing).
+	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+
+	// S4-3 fastmem path: no iFlushCall — see recLQC2. The source quad is
+	// read from VU0.VF[ft] memory into RQSCRATCH (q30, never allocator-
+	// tracked): ft's memory is current because the VF compile cache was
+	// flushed (dirty writebacks emitted) before this emitter ran.
+	if (useFastmem)
+	{
+		recComputeAddr();
+		armAsm->And(a64::w9, a64::w9, (u32)~0xF);
+		_flushConstRegs(true);
+		armAsm->Ldr(RQSCRATCH, armVU0Mem(&VU0.VF[_Rt_]));
+		vtlbFastmemWrite128(9, RQSCRATCH.GetCode());
+		return;
+	}
+
+	// Softmem: addr = (rs + imm) & ~0xF — allocator-aware (rs may still be
+	// live in a host reg if the sync above emitted nothing).
 	recComputeAddr();
 	armAsm->And(a64::w9, a64::w9, (u32)~0xF);
 
@@ -1607,13 +1670,9 @@ void recSQC2()
 	// contents while leaving arm64neon[0] still marked dirty. The next
 	// allocator flush would then write back the stomped value (VU0.VF[rt])
 	// to the FPREG's memory slot, corrupting the FPREG.
-	armLoadPtr(a64::q0, &VU0.VF[_Rt_].UQ);
+	armAsm->Ldr(a64::q0, armVU0Mem(&VU0.VF[_Rt_]));
 
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
-	if (useFastmem)
-		vtlbFastmemWrite128(9, 0);
-	else
-		vtlbSoftmemWrite128(9);
+	vtlbSoftmemWrite128(9);
 }
 
 } // namespace OpcodeImpl

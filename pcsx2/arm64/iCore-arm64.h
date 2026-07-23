@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
 #pragma once
@@ -108,6 +108,9 @@ struct _arm64gprregs
 	u8 mode;      // MODE_READ / MODE_WRITE
 	u8 needed;    // pinned for current instruction
 	u8 type;      // ARM64TYPE_*
+	u8 looppin;   // SL-1 loop-resident entry: LRU eviction avoids it (preference,
+	              // not a bar — seams and explicit deletes still free it; the
+	              // back-edge reconcile restores the mapping)
 	u16 counter;  // LRU counter
 	u32 extra;    // extra info (e.g., IOP constant regs)
 };
@@ -127,6 +130,17 @@ struct _arm64gprregs
 // (GE-15; iFlushCall's retention loop keys off this range).
 static constexpr u32 NEON_CALLEE_SAVED_START = 10;
 static constexpr u32 NEON_CALLEE_SAVED_END = 16; // exclusive
+
+// SL-13: q25/q26 are dedicated to the COP2 macro clamp-constant broadcasts
+// (q25 = maxFloat.4S = +FLT_MAX, q26 = minFloat.4S = -FLT_MAX) and excluded
+// from the NEON allocator pool entirely, like q8/q9. They are lazily
+// re-materialized per block from the pinned s8/s9 scalars (2 Dups, no memory)
+// — see cop2EnsureClampConsts in iCOP2-arm64.cpp for the compile-time
+// validity discipline. The COP2 macro-mode mVU pool excludes them too
+// (microRegAlloc::reset(cop2mode)); micro-mode mVU may clobber them freely —
+// every EE-side path back from micro execution re-materializes.
+static constexpr u32 NEON_RESERVED_COP2_CLAMPMAX = 25;
+static constexpr u32 NEON_RESERVED_COP2_CLAMPMIN = 26;
 
 // x86 type aliases — used by shared analysis code (iR5900Analysis.cpp)
 #define XMMTYPE_TEMP    NEONTYPE_TEMP

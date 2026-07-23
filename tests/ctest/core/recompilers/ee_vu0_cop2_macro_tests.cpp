@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
 // EE-issued COP2 macro-mode VU ops + VCALLMS microprogram kick.
@@ -100,6 +100,85 @@ TEST(EeVu0Cop2Macro, VmulXyzwProductsLanes)
 	EXPECT_FLOAT_EQ(h.GetVu0VfJit(3, 'w'), 50.0f);
 	for (char l : {'x','y','z','w'})
 		EXPECT_EQ(h.GetVu0VfBitsJit(3, l), h.GetVu0VfBitsInterp(3, l));
+}
+
+// True Crime NYC black-world regression (2026-07-20): the game zeroes W with
+// `vsub.w vf1,vf1,vf1` after a QMTC2 left exp-FF bit patterns in the upper
+// lanes. PS2 VU floats have no inf/NaN — exp-FF is a valid huge number and
+// x - x is exactly +0 in every lane. A raw host Fsub gives NaN - NaN = NaN,
+// and the result clamp then manufactures +FLT_MAX (0x7f7fffff) where the
+// architecture demands 0 — blowing up the camera/bbox kernel. Mirrors
+// microVU_Upper's (_Ft_ == _Fs_) opCase1 zero short-circuit (non-broadcast
+// only); the micro-mode arm64 port has it, the hand-rolled macro op dropped
+// it.
+TEST(EeVu0Cop2Macro, VsubSameRegNanPatternIsExactZeroMaskedW)
+{
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0VfBits(1, 0x3f800000u, 0x40000000u, 0xff800000u, 0xffffffffu);
+	h.LoadProgram({VSUB_C2(/*mask w*/ 0x1, /*fd*/1, /*fs*/1, /*ft*/1)});
+	h.Run();
+	EXPECT_EQ(h.GetVu0VfBitsJit(1, 'w'), 0u);
+	// Unmasked lanes keep their original bit patterns.
+	EXPECT_EQ(h.GetVu0VfBitsJit(1, 'x'), 0x3f800000u);
+	EXPECT_EQ(h.GetVu0VfBitsJit(1, 'z'), 0xff800000u);
+	for (char l : {'x', 'y', 'z', 'w'})
+		EXPECT_EQ(h.GetVu0VfBitsJit(1, l), h.GetVu0VfBitsInterp(1, l));
+}
+
+TEST(EeVu0Cop2Macro, VsubSameRegNanPatternIsExactZeroFullMask)
+{
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0VfBits(2, 0xffffffffu, 0x7fffffffu, 0xff800000u, 0x7f800000u);
+	h.LoadProgram({VSUB_C2(mask_xyzw, /*fd*/3, /*fs*/2, /*ft*/2)});
+	h.Run();
+	for (char l : {'x', 'y', 'z', 'w'})
+	{
+		EXPECT_EQ(h.GetVu0VfBitsJit(3, l), 0u);
+		EXPECT_EQ(h.GetVu0VfBitsJit(3, l), h.GetVu0VfBitsInterp(3, l));
+	}
+}
+
+// OutRun 2006 cars-through-floor regression (2026-07-20): the True Crime VSUB
+// fix hoisted `rd = cop2ResultReg(_Fd)` above the operand loads. For a full
+// mask, cop2ResultReg claims _Fd's VF-cache slot with fill=false (resident but
+// UNLOADED); if _Fd aliases _Fs/_Ft (the ubiquitous `vsub vfd,vfd,vft`), the
+// following cop2GetVF finds that empty slot and returns garbage instead of the
+// operand. VADD/VMUL load operands before claiming rd — VSUB must too. Trigger
+// needs _Fd non-resident (fresh cache), which a single op guarantees.
+TEST(EeVu0Cop2Macro, VsubFullMaskFdAliasesFsReadsRealOperand)
+{
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(5, 100.0f, 200.0f, 300.0f, 400.0f);
+	h.SeedVu0Vf(6, 10.0f, 20.0f, 30.0f, 40.0f);
+	h.LoadProgram({VSUB_C2(mask_xyzw, /*fd*/5, /*fs*/5, /*ft*/6)});
+	h.Run();
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(5, 'x'), 90.0f);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(5, 'y'), 180.0f);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(5, 'z'), 270.0f);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(5, 'w'), 360.0f);
+	for (char l : {'x', 'y', 'z', 'w'})
+		EXPECT_EQ(h.GetVu0VfBitsJit(5, l), h.GetVu0VfBitsInterp(5, l));
+}
+
+TEST(EeVu0Cop2Macro, VsubFullMaskFdAliasesFtReadsRealOperand)
+{
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(5, 10.0f, 20.0f, 30.0f, 40.0f);
+	h.SeedVu0Vf(6, 100.0f, 200.0f, 300.0f, 400.0f);
+	h.LoadProgram({VSUB_C2(mask_xyzw, /*fd*/5, /*fs*/6, /*ft*/5)});
+	h.Run();
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(5, 'x'), 90.0f);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(5, 'w'), 360.0f);
+	for (char l : {'x', 'y', 'z', 'w'})
+		EXPECT_EQ(h.GetVu0VfBitsJit(5, l), h.GetVu0VfBitsInterp(5, l));
 }
 
 TEST(EeVu0Cop2Macro, VaddMaskedYZOnlyTouchesYZ)
@@ -1358,6 +1437,262 @@ TEST(EeVu0Cop2MacroFlagHack, StatusDeadStandaloneSkipsButKeepsResult)
 }
 
 // =========================================================================
+//  vuFlagHack MAC/status-liveness elision inside cop2EmitFlagUpdate (EP-2a)
+//
+//  The hand-rolled COP2 macro FMAC bodies gate the whole flag-extraction
+//  body (Cmlt/Fcmeq/lane-pack + MAC store + denorm-scratch RMW) on the same
+//  COP2FlagHackPass liveness bits the mVU-reuse path already honors. These
+//  tests pin the three semantic corners: a live reader keeps flags exact, an
+//  elided INTERMEDIATE MAC write is exact by overwrite semantics, and the
+//  last write in a block is always committed live (CommitAllFlags) so the
+//  architectural registers are correct at block exit.
+// =========================================================================
+
+TEST(EeVu0Cop2MacroFlagHack, MacLiveAcrossCfc2NotSkipped)
+{
+	// The CFC2 of REG_MAC_FLAG marks the VADD's MAC write live; the JIT-read
+	// MAC must match the interpreter exactly. Result (-4, 0, 4, 5): lane x
+	// sets a sign bit, lane y a zero bit -> nonzero MAC.
+	EeRecTestHarness h;
+	ScopedFlagHack flagHack(true);
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, -5.0f, 0.0f, 3.0f, 4.0f);
+	h.SeedVu0Vf(2,  1.0f, 0.0f, 1.0f, 1.0f);
+	h.LoadProgram({
+		VADD_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2),
+		CFC2(reg::t0, REG_MAC_FLAG),
+	});
+	h.Run();
+	EXPECT_EQ(h.GetGpr64Jit(reg::t0), h.GetGpr64Interp(reg::t0));
+	EXPECT_NE(h.GetGpr64Jit(reg::t0), 0u);
+}
+
+TEST(EeVu0Cop2MacroFlagHack, IntermediateDeadMacElisionIsExact)
+{
+	// Two MAC writers, then a CFC2 of MAC: the pass marks only the SECOND
+	// VADD live (MAC is a plain overwrite, the first write is unobservable),
+	// so eliding the first body is exact — full JIT-vs-interp diff must pass
+	// including the CFC2-read value. The dead op's result (2,4,6,8) sets no
+	// flag lanes, so the interp's always-on sticky accumulation stays inert
+	// and the full-state diff isolates MAC-elision exactness (the sticky-loss
+	// divergence is pinned separately below).
+	EeRecTestHarness h;
+	ScopedFlagHack flagHack(true);
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, -5.0f, 0.0f, 3.0f, 4.0f);
+	h.SeedVu0Vf(2,  1.0f, 0.0f, 1.0f, 1.0f);
+	h.SeedVu0Vf(4,  1.0f, 2.0f, 3.0f, 4.0f);
+	h.LoadProgram({
+		VADD_C2(mask_xyzw, /*fd*/5, /*fs*/4, /*ft*/4), // MAC dead (overwritten), no flag lanes
+		VADD_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2), // MAC live (CFC2 reads it)
+		CFC2(reg::t0, REG_MAC_FLAG),
+	});
+	h.Run();
+	EXPECT_EQ(h.GetGpr64Jit(reg::t0), h.GetGpr64Interp(reg::t0));
+	EXPECT_NE(h.GetGpr64Jit(reg::t0), 0u); // (-4,0,4,5): sign + zero lanes set
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(5, 'w'), 8.0f); // elided-flag op's result intact
+}
+
+TEST(EeVu0Cop2MacroFlagHack, LastWriteInBlockCommitsBothFlags)
+{
+	// A standalone FMAC with no in-block reader is still the block's LAST
+	// MAC/status write, which CommitAllFlags marks live — so the architectural
+	// VI regs must be up to date at block exit for a later block's CFC2. The
+	// full post-state diff (VU0.VI included) against the always-accurate
+	// interpreter is the assertion.
+	EeRecTestHarness h;
+	ScopedFlagHack flagHack(true);
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, -5.0f, 0.0f, 3.0f, 4.0f);
+	h.SeedVu0Vf(2,  1.0f, 0.0f, 1.0f, 1.0f);
+	h.LoadProgram({VADD_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2)});
+	h.Run();
+	EXPECT_NE(h.GetVu0ViJit(REG_MAC_FLAG), 0u);
+	EXPECT_EQ(h.GetVu0ViJit(REG_MAC_FLAG), h.GetVu0ViInterp(REG_MAC_FLAG));
+	EXPECT_EQ(h.GetVu0ViJit(REG_STATUS_FLAG), h.GetVu0ViInterp(REG_STATUS_FLAG));
+}
+
+TEST(EeVu0Cop2MacroFlagHack, LastWriteCommitsAfterSwappedDelaySlotContinuation)
+{
+	// SL-07 regression (UYA falls through the floor): at a superblock
+	// continuation site whose delay slot TrySwapDelaySlot HOISTS ahead of the
+	// compare, recompileNextInstruction(swapped_delay_slot=true) restores
+	// g_pCurInstInfo to the branch's entry — correct when the branch ended the
+	// block (the x86 shape it was ported from), but a continuation keeps
+	// compiling, so every later op in the block read its PREDECESSOR's EEINST.
+	// Here that makes the VADD — the block's last MAC/status writer, which
+	// CommitAllFlags marks live — read the delay slot's info instead and elide
+	// its whole flag body under vuFlagHack, leaving the architectural VI regs
+	// stale at block exit.
+	EeRecTestHarness h;
+	ScopedFlagHack flagHack(true);
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, -5.0f, 0.0f, 3.0f, 4.0f);
+	h.SeedVu0Vf(2,  1.0f, 0.0f, 1.0f, 1.0f);
+	h.SetGpr64(reg::t5, 1); // >= 0 → BLTZ falls through (continuation path runs)
+	h.LoadProgram({
+		BLTZ(reg::t5, 3),            // forward conditional → continuation site
+		ORI(reg::t6, reg::t6, 1),    // delay slot: no hazard vs t5 → swap-hoisted
+		VADD_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2), // last MAC/status writer
+	});
+	h.Run();
+	EXPECT_NE(h.GetVu0ViJit(REG_MAC_FLAG), 0u); // (-4,0,4,5): sign + zero lanes
+	EXPECT_EQ(h.GetVu0ViJit(REG_MAC_FLAG), h.GetVu0ViInterp(REG_MAC_FLAG));
+	EXPECT_EQ(h.GetVu0ViJit(REG_STATUS_FLAG), h.GetVu0ViInterp(REG_STATUS_FLAG));
+	EXPECT_EQ(h.GetGpr64Jit(reg::t6), 1u); // hoisted slot executed exactly once
+}
+
+TEST(EeVu0Cop2MacroFlagHack, IntermediateStickyLossIsTheDocumentedHack)
+{
+	// The accepted vuFlagHack divergence, pinned so it only changes on
+	// purpose: an intermediate status write's STICKY contribution is lost
+	// when elided. Op 1 (result -4,0,4,5) would set S+Z sticky; op 2 (result
+	// 2,4,6,8) sets none. The CFC2 marks op 2 live; op 1 stays dead. The
+	// interpreter accumulates op 1's sticky bits, the JIT does not — assert
+	// the JIT value alone (status reads all-clear), no interp diff.
+	EeRecTestHarness h;
+	ScopedFlagHack flagHack(true);
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, -5.0f, 0.0f, 3.0f, 4.0f);
+	h.SeedVu0Vf(2,  1.0f, 0.0f, 1.0f, 1.0f);
+	h.SeedVu0Vf(4,  1.0f, 2.0f, 3.0f, 4.0f);
+	h.LoadProgram({
+		VADD_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2), // status dead, sticky lost
+		VADD_C2(mask_xyzw, /*fd*/5, /*fs*/4, /*ft*/4), // status live via CFC2
+		CFC2(reg::t0, REG_STATUS_FLAG),
+	});
+	h.RunJitNoDiff();
+	EXPECT_EQ(h.GetGpr64Jit(reg::t0), 0u);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(5, 'w'), 8.0f);
+}
+
+// =========================================================================
+//  EP-4: lazy cross-op status normalization (x86 setupMacroOp/endMacroOp
+//  parity)
+//
+//  With vuFlagHack on, COP2FlagHackPass marks the FIRST status-writing op of
+//  each chain EEINST_COP2_DENORMALIZE_STATUS_FLAG and the LAST one before a
+//  consumer (CFC2/CTC2 of STATUS, VCALLMS, block end) EEINST_COP2_NORMALIZE_
+//  STATUS_FLAG. The arm64 emitter denormalizes/normalizes only at those
+//  marks; between them cop2Rec.denormStatusFlag is authoritative and
+//  VI[REG_STATUS_FLAG] is stale. These tests pin the chain semantics the
+//  x86 JIT (the oracle) implements via gprF0 persistence.
+// =========================================================================
+
+TEST(EeVu0Cop2MacroLazyStatus, ChainStickyAccumulatesAcrossLiveOps)
+{
+	// A CTC2-of-STATUS ahead of the chain triggers the pass's read-ahead
+	// pairing ("Tekken pattern", m_cfc2_pc), which marks the INTERMEDIATE
+	// status writes live too — the one flaghack case with multiple live
+	// updates per normalize. Pass marks: VADD1 DENORMALIZE+STATUS, VADD2
+	// STATUS+NORMALIZE. Op 1's Z/S must survive into the sticky bits even
+	// though only op 2's normalize writes VI — the normalize derives sticky
+	// from the denorm scratch's bits 0-7, not from the (stale) VI value.
+	// Interp accumulates per-op to the same result -> full diff holds.
+	EeRecTestHarness h;
+	ScopedFlagHack flagHack(true);
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, -5.0f, 0.0f, 3.0f, 4.0f); // -> (-4, 0, 4, 5): S + Z lanes
+	h.SeedVu0Vf(2,  1.0f, 0.0f, 1.0f, 1.0f);
+	h.SeedVu0Vf(4,  1.0f, 2.0f, 3.0f, 4.0f); // -> (2, 4, 6, 8): no flag lanes
+	h.LoadProgram({
+		CTC2(reg::zero, REG_STATUS_FLAG),              // clear + pair with the CFC2
+		VADD_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2), // sticky Z+S from here
+		VADD_C2(mask_xyzw, /*fd*/5, /*fs*/4, /*ft*/4), // current: none
+		CFC2(reg::t0, REG_STATUS_FLAG),
+	});
+	h.Run();
+	EXPECT_EQ(h.GetGpr64Jit(reg::t0), h.GetGpr64Interp(reg::t0));
+	const u64 status = h.GetGpr64Jit(reg::t0);
+	EXPECT_EQ(status & 0x3u, 0u);     // current Z/S are op 2's (none)
+	EXPECT_EQ(status & 0xC0u, 0xC0u); // sticky ZS+SS from op 1 survived
+}
+
+TEST(EeVu0Cop2MacroLazyStatus, ChainCurrentIsLastOpsContribution)
+{
+	// Reverse order of the test above: the no-flag op first, the S+Z op
+	// last. Current bits must be exactly the LAST op's contribution and
+	// sticky the union — guards against a current/sticky swap in the
+	// normalize's field extraction.
+	EeRecTestHarness h;
+	ScopedFlagHack flagHack(true);
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, -5.0f, 0.0f, 3.0f, 4.0f);
+	h.SeedVu0Vf(2,  1.0f, 0.0f, 1.0f, 1.0f);
+	h.SeedVu0Vf(4,  1.0f, 2.0f, 3.0f, 4.0f);
+	h.LoadProgram({
+		VADD_C2(mask_xyzw, /*fd*/5, /*fs*/4, /*ft*/4), // no flag lanes
+		VADD_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2), // S + Z lanes
+		CFC2(reg::t0, REG_STATUS_FLAG),
+	});
+	h.Run();
+	EXPECT_EQ(h.GetGpr64Jit(reg::t0), h.GetGpr64Interp(reg::t0));
+	const u64 status = h.GetGpr64Jit(reg::t0);
+	EXPECT_EQ(status & 0x3u, 0x3u);   // current Z+S from op 2
+	EXPECT_EQ(status & 0xC0u, 0xC0u); // sticky ZS+SS
+}
+
+TEST(EeVu0Cop2MacroLazyStatus, DivCurrentDIBitsSurviveFmac)
+{
+	// x86-shape pin (JIT-only): the FMAC status update clears current
+	// Z/S/U/O but PRESERVES current I/D (x86 mVUupdateFlags ANDs the denorm
+	// value with 0xfffc00ff, keeping bits 18-19), so a VDIV's div-by-zero
+	// bit is still visible in the CURRENT field after a following FMAC. The
+	// interp clears current I/D on every macro FMAC status sync
+	// (SYNCMSFLAGS preserves only 0xFC0) — accepted JIT-vs-interp
+	// divergence; per the standing rule the x86 JIT is the clamp/flag
+	// oracle, not the interp.
+	EeRecTestHarness h;
+	ScopedFlagHack flagHack(true);
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, 2.0f, 0.0f, 0.0f, 0.0f);
+	h.SeedVu0Vf(2, 0.0f, 0.0f, 0.0f, 0.0f); // ft.x = 0 -> div-by-zero (D)
+	h.SeedVu0Vf(4, 1.0f, 2.0f, 3.0f, 4.0f);
+	h.LoadProgram({
+		VDIV_C2(/*fsf*/0, /*ftf*/0, /*fs*/1, /*ft*/2), // Q = 2/0: D current+sticky
+		VADD_C2(mask_xyzw, /*fd*/5, /*fs*/4, /*ft*/4), // must not clear current D
+		CFC2(reg::t0, REG_STATUS_FLAG),
+	});
+	h.RunJitNoDiff();
+	const u64 status = h.GetGpr64Jit(reg::t0);
+	EXPECT_NE(status & 0x20u, 0u) << "current D lost across FMAC";
+	EXPECT_NE(status & 0x800u, 0u) << "sticky D lost across FMAC";
+}
+
+TEST(EeVu0Cop2MacroLazyStatus, DivStickyAccumulatesAcrossDivs)
+{
+	// x86-shape pin (JIT-only): a clean divide clears the CURRENT I/D bits
+	// but must not clear the STICKY ones an earlier faulting divide set (x86
+	// mVU_DIV: gprF &= ~0xc0000 — current only — then |= divFlag). The
+	// interp's SYNCFDIV rebuilds sticky D/I from current alone (preserves
+	// only 0x3CF), losing the earlier divide's sticky — same accepted
+	// divergence class as above.
+	EeRecTestHarness h;
+	ScopedFlagHack flagHack(true);
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, 2.0f, 0.0f, 0.0f, 0.0f);
+	h.SeedVu0Vf(2, 0.0f, 4.0f, 0.0f, 0.0f); // ft.x = 0 (faults), ft.y = 4 (clean)
+	h.LoadProgram({
+		VDIV_C2(/*fsf*/0, /*ftf*/0, /*fs*/1, /*ft*/2), // 2/0: D current+sticky
+		VDIV_C2(/*fsf*/0, /*ftf*/1, /*fs*/1, /*ft*/2), // 2/4: clean, clears current
+		CFC2(reg::t0, REG_STATUS_FLAG),
+	});
+	h.RunJitNoDiff();
+	const u64 status = h.GetGpr64Jit(reg::t0);
+	EXPECT_EQ(status & 0x20u, 0u) << "current D must be cleared by the clean divide";
+	EXPECT_NE(status & 0x800u, 0u) << "sticky D lost across divides";
+}
+
+// =========================================================================
 //  Pending-VU0-micro drain on DIV-unit / no-op COP2 macro ops
 // =========================================================================
 //
@@ -1878,6 +2213,350 @@ TEST(EeVu0SyncThin, LargeDeltaPassesThroughBothVariants)
 		vu0SyncRunAheadThin();
 		EXPECT_EQ(f.mock.lastCycles, 5000u);
 	}
+}
+
+// =========================================================================
+//  EP-2b: VF/ACC residency cache across consecutive hand-rolled COP2 ops
+//
+//  The hand-rolled macro FMAC bodies keep VF operands and ACC resident in
+//  q16-q20 across runs of cache-aware COP2 ops (iCOP2-arm64.cpp). These
+//  tests pin the coherence corners: dirty forwarding within a chain, ACC
+//  chain coalescing, merge-into-cached-dirty dest masks, invalidation when
+//  a non-whitelisted op writes VF behind the cache's back (QMTC2, VCALLMS
+//  micro), flush-before-read for QMFC2, and per-fork writeback when a COP2
+//  op sits in a branch delay slot. All run the full JIT-vs-interp post-state
+//  diff — the interpreter has no cache, so any missed writeback/invalidate
+//  shows up as a state divergence.
+// =========================================================================
+
+TEST(EeVu0Cop2VfCache, VfReuseAndDirtyForwarding)
+{
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, 1.0f, 2.0f, 3.0f, 4.0f);
+	h.SeedVu0Vf(2, 5.0f, 6.0f, 7.0f, 8.0f);
+	h.LoadProgram({
+		VADD_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2), // f3 = (6,8,10,12), dirty
+		VMUL_C2(mask_xyzw, /*fd*/4, /*fs*/3, /*ft*/1), // reads cached-dirty f3
+		VSUB_C2(mask_xyzw, /*fd*/5, /*fs*/4, /*ft*/3), // reads both dirty regs
+	});
+	h.Run();
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(4, 'x'), 6.0f);   // 6*1
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(4, 'w'), 48.0f);  // 12*4
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(5, 'x'), 0.0f);   // 6-6
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(5, 'w'), 36.0f);  // 48-12
+}
+
+TEST(EeVu0Cop2VfCache, AccChainCoalesced)
+{
+	// VMULAx / VMADDAx round-trip ACC through the dedicated cache slot; the
+	// final VMADDx consumes it into a VF. The interp diff catches any lost
+	// intermediate ACC state.
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, 1.0f, 2.0f, 3.0f, 4.0f);
+	h.SeedVu0Vf(2, 10.0f, 0.0f, 0.0f, 0.0f);
+	h.SeedVu0Acc(999.0f, 999.0f, 999.0f, 999.0f); // must be fully overwritten
+	h.LoadProgram({
+		VMULAx_C2(mask_xyzw, /*fs*/1, /*ft*/2),        // ACC = f1*10 = (10,20,30,40)
+		VMADDAx_C2(mask_xyzw, /*fs*/1, /*ft*/2),       // ACC += f1*10 = (20,40,60,80)
+		VMADDx_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2), // f3 = ACC + f1*10 = (30,60,90,120)
+	});
+	h.Run();
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(3, 'x'), 30.0f);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(3, 'w'), 120.0f);
+}
+
+TEST(EeVu0Cop2VfCache, MaskedWriteMergesIntoCachedDirty)
+{
+	// Full write caches f3 dirty; the xy-masked VSUB must merge into the
+	// CACHED value (not stale memory), and the zw lanes must survive.
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, 1.0f, 2.0f, 3.0f, 4.0f);
+	h.SeedVu0Vf(2, 5.0f, 6.0f, 7.0f, 8.0f);
+	h.LoadProgram({
+		VADD_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2),      // f3 = (6,8,10,12)
+		VSUB_C2(0xC /*xy*/, /*fd*/3, /*fs*/2, /*ft*/1),     // f3.xy = (4,4); zw kept
+	});
+	h.Run();
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(3, 'x'), 4.0f);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(3, 'y'), 4.0f);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(3, 'z'), 10.0f);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(3, 'w'), 12.0f);
+}
+
+TEST(EeVu0Cop2VfCache, QmfcReadsFlushedDirtyVf)
+{
+	// QMFC2 reads VF memory raw — the classifier flush must write the dirty
+	// cached f3 back before the read.
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, 1.0f, 2.0f, 3.0f, 4.0f);
+	h.SeedVu0Vf(2, 5.0f, 6.0f, 7.0f, 8.0f);
+	h.LoadProgram({
+		VADD_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2), // f3 = (6,8,10,12), dirty
+		QMFC2(reg::t0, /*fs*/3),
+	});
+	h.Run();
+	// t0 low 64 = lanes x,y as raw bits
+	const u64 expect = (u64(0x41000000) << 32) | 0x40C00000; // y=8.0f | x=6.0f
+	EXPECT_EQ(h.GetGpr64Jit(reg::t0), expect);
+}
+
+TEST(EeVu0Cop2VfCache, QmtcInvalidatesCachedVf)
+{
+	// QMTC2 writes VF memory behind the cache's back; the following VADD
+	// must consume the NEW value, not a stale cached copy.
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, 1.0f, 2.0f, 3.0f, 4.0f);
+	h.SeedVu0Vf(2, 5.0f, 6.0f, 7.0f, 8.0f);
+	h.SetGpr128(reg::t0, 0x42C8000042C80000ull, 0x42C8000042C80000ull); // 100.0f x4
+	h.LoadProgram({
+		VADD_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2), // f3 cached dirty
+		QMTC2(reg::t0, /*fs*/3),                       // f3 = (100,100,100,100)
+		VADD_C2(mask_xyzw, /*fd*/4, /*fs*/3, /*ft*/1), // must see 100s
+	});
+	h.Run();
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(4, 'x'), 101.0f);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(4, 'w'), 104.0f);
+}
+
+TEST(EeVu0Cop2VfCache, BranchDelaySlotWritebackTakenPath)
+{
+	// A COP2 op in a taken-branch delay slot populates the cache inside the
+	// fork; the fork's tail must emit its own writeback. The interp diff
+	// catches a lost f3.
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, 1.0f, 2.0f, 3.0f, 4.0f);
+	h.SeedVu0Vf(2, 5.0f, 6.0f, 7.0f, 8.0f);
+	h.LoadProgram({
+		BEQ(reg::zero, reg::zero, 2),                  // always taken, skips the ADDIU
+		VADD_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2), // delay slot: f3 dirty in-fork
+		ADDIU(reg::t1, reg::zero, 5),                  // squashed by the taken branch
+		ADDIU(reg::t2, reg::zero, 7),                  // branch target
+	});
+	h.Run();
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(3, 'x'), 6.0f);
+	EXPECT_EQ(h.GetGpr64Jit(reg::t1), 0u);
+	EXPECT_EQ(h.GetGpr64Jit(reg::t2), 7u);
+}
+
+TEST(EeVu0Cop2VfCache, BranchDelaySlotWritebackFallthroughPath)
+{
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(1, 1.0f, 2.0f, 3.0f, 4.0f);
+	h.SeedVu0Vf(2, 5.0f, 6.0f, 7.0f, 8.0f);
+	h.LoadProgram({
+		BNE(reg::zero, reg::zero, 2),                  // never taken
+		VADD_C2(mask_xyzw, /*fd*/3, /*fs*/1, /*ft*/2), // delay slot: f3 dirty in-fork
+		ADDIU(reg::t1, reg::zero, 5),                  // executed on fall-through
+		ADDIU(reg::t2, reg::zero, 7),
+	});
+	h.Run();
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(3, 'w'), 12.0f);
+	EXPECT_EQ(h.GetGpr64Jit(reg::t1), 5u);
+	EXPECT_EQ(h.GetGpr64Jit(reg::t2), 7u);
+}
+
+TEST(EeVu0Cop2VfCache, VmoveSelfMoveIsANoop)
+{
+	// VMOVE fx,fx with fx UNCACHED: the no-fill dest claim must not let the
+	// source lookup hit the just-claimed (uninitialized) slot — f3 must be
+	// bit-exactly preserved.
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vf(3, 1.5f, -2.5f, 3.5f, -4.5f);
+	h.LoadProgram({
+		VMOVE_C2(mask_xyzw, /*ft*/3, /*fs*/3),
+		VADD_C2(mask_xyzw, /*fd*/4, /*fs*/3, /*ft*/3), // consume f3 through the cache
+	});
+	h.Run();
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(3, 'x'), 1.5f);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(3, 'w'), -4.5f);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(4, 'y'), -5.0f);
+}
+
+TEST(EeVu0Cop2VfCache, VcallmsInvalidatesCachedVfAndDrainSeesFreshValue)
+{
+	// A COP2 op caches vf2 pre-kick; VCALLMS runs a micro that rewrites vf2;
+	// the next COP2 op (carrying the FINISH mark) must drain the micro and
+	// read the FRESH vf2 from memory, never the stale cached copy.
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vi(REG_VPU_STAT, 0);
+	h.SeedVu0Vf(1,  2.0f,  2.0f,  2.0f,  2.0f);
+	h.SeedVu0Vf(2, 32.0f, 32.0f, 32.0f, 32.0f); // stale; micro rewrites to 4.0
+	SeedPendingMicroDoubling(h, /*vf_dst*/2, /*vf_src*/1);
+	h.LoadProgram({
+		VADD_C2(mask_xyzw, /*fd*/9, /*fs*/2, /*ft*/2),  // caches pre-kick vf2: f9 = 64s
+		VCALLMS(0),
+		VADD_C2(mask_xyzw, /*fd*/10, /*fs*/2, /*ft*/2), // drains micro, must see vf2 = 4
+	});
+	h.Run();
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(9, 'x'), 64.0f);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(2, 'x'), 4.0f);
+	EXPECT_FLOAT_EQ(h.GetVu0VfJit(10, 'x'), 8.0f);
+}
+
+// =========================================================================
+//  Jak 3 camera-basis kernel replay (guest 0x0061b44c, SCUS-97330)
+// =========================================================================
+//
+// Faithful straight-line replay of the Naughty Dog VU0-macro camera kernel
+// that produces the fMax-flooded vertex pages in the Jak 3 EE-JIT-vs-interp
+// stepdiff (2026-07-19): quaternion -> basis via VOPMULA/VOPMSUB cross
+// products, +1.0 diagonal via VADDw-broadcast, scale via VMULx/y/z broadcast,
+// then a 4x4 matrix transform via the VMULAx/VMADDAy/VMADDAz/VMADDw ACC
+// chain, stored with SQC2. All encodings verified bit-exact against the game
+// words (e.g. vmulax.xyzw ACC,vf07,vf02x = 0x4be239bc).
+//
+// The game routine's two div.s (1/w perspective feeders) are omitted: they
+// are dead in the fall-through (no-perspective) path replayed here, and EE
+// FPU DIV.S JIT-vs-interp rounding (FPUDiv Nearest vs ambient chop) is a
+// known benign divergence that would false-positive the harness auto-diff.
+//
+// For finite inputs the VU0 interpreter computes the same single-precision
+// float ops as the NEON macro emitters must, so bitwise JIT==interp is the
+// correct expectation on every lane.
+
+namespace
+{
+	// Broadcast VADD/VSUB (upper funct 0x00-0x03 / 0x04-0x07; bc x=0,y=1,z=2,w=3).
+	constexpr u32 VADDbc_C2(u32 mask_xyzw, u32 fd, u32 fs, u32 ft, u32 bc)
+	{
+		return COP2_FMAC(mask_xyzw, fd, fs, ft, 0x00 + bc);
+	}
+	constexpr u32 VSUBbc_C2(u32 mask_xyzw, u32 fd, u32 fs, u32 ft, u32 bc)
+	{
+		return COP2_FMAC(mask_xyzw, fd, fs, ft, 0x04 + bc);
+	}
+	// VMADDAz — SPECIAL2 ACC broadcast MADD, z lane (fd-slot 0x02, funct 0x3E).
+	constexpr u32 VMADDAz_C2_(u32 mask_xyzw, u32 fs, u32 ft)
+	{
+		return COP2_FMAC(mask_xyzw, 0x02, fs, ft, 0x3E);
+	}
+
+	constexpr u32 kBcX = 0, kBcY = 1, kBcZ = 2, kBcW = 3;
+} // namespace
+
+TEST(EeVu0Cop2Macro, Jak3CameraBasisKernelChainMatchesInterp)
+{
+	constexpr u32 kIn  = RecompilerTestEnvironment::kScratchAddr + 0x000; // vf15 / vf05 / vf01
+	constexpr u32 kMtx = RecompilerTestEnvironment::kScratchAddr + 0x100; // vf07..vf10 + floats
+	constexpr u32 kOut = RecompilerTestEnvironment::kScratchAddr + 0x200; // vf11..vf14
+
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+
+	auto wf = [&](u32 addr, float v) {
+		u32 bits;
+		std::memcpy(&bits, &v, sizeof(bits));
+		h.WriteU32(addr, bits);
+	};
+	auto wq = [&](u32 addr, float x, float y, float z, float w) {
+		wf(addr + 0x0, x); wf(addr + 0x4, y); wf(addr + 0x8, z); wf(addr + 0xC, w);
+	};
+
+	// Input block: position, unit quaternion, per-axis scale.
+	wq(kIn + 0x00, 1234.5f, -678.25f, 4321.75f, 1.0f);                        // -> vf15
+	wq(kIn + 0x10, 0.18257419f, 0.36514837f, 0.54772256f, 0.73029674f);       // -> vf05
+	wq(kIn + 0x20, 1.5f, 0.75f, 1.25f, 1.0f);                                 // -> vf01
+	// Camera matrix rows + trailing floats, as the game lays them out.
+	wq(kMtx + 0x00, 1.2f, 0.1f, -0.3f, 0.05f);                                // -> vf07
+	wq(kMtx + 0x10, -0.2f, 1.5f, 0.4f, -0.1f);                                // -> vf08
+	wq(kMtx + 0x20, 0.3f, -0.25f, 1.1f, 0.2f);                                // -> vf09
+	wq(kMtx + 0x30, 12345.0f, -6789.0f, 23456.0f, 1.0f);                      // -> vf10
+	wf(kMtx + 0x40, 2.5f);  // f01
+	wf(kMtx + 0x44, 3.25f); // f02
+	wf(kMtx + 0x48, 1.75f); // f03
+	h.WriteU32(kMtx + 0x4C, 0); // fall-through flag
+
+	h.SetGpr64(reg::a1, kIn);
+	h.SetGpr64(reg::t0, kMtx);
+	h.SetGpr64(reg::a2, kOut);
+	h.TrackMemWindow(kOut, 0x40);
+
+	h.LoadProgram({
+		LUI(reg::v1, 0x3F80),
+		LQC2(5, reg::a1, 0x10),
+		MTC1(reg::v1, 0), // f00 = 1.0f
+		LQC2(15, reg::a1, 0x00),
+		LQC2(1, reg::a1, 0x20),
+		LQC2(7, reg::t0, 0x00),
+		LQC2(8, reg::t0, 0x10),
+		LQC2(9, reg::t0, 0x20),
+		LQC2(10, reg::t0, 0x30),
+		LWC1(1, 0x40, reg::t0),
+		LWC1(2, 0x44, reg::t0),
+		LWC1(3, 0x48, reg::t0),
+		VADD_C2(0xF, /*fd*/6, /*fs*/5, /*ft*/5),                 // vf06 = 2q
+		VADDbc_C2(0x8, /*fd*/2, /*fs*/0, /*ft*/5, kBcW),         // vf02.x = +q.w
+		VADDbc_C2(0x4, 2, 0, 5, kBcZ),                           // vf02.y = +q.z
+		VSUBbc_C2(0x2, 2, 0, 5, kBcY),                           // vf02.z = -q.y
+		VSUBbc_C2(0x1, 2, 0, 0, kBcW),                           // vf02.w = 0
+		VSUBbc_C2(0x8, 3, 0, 5, kBcZ),                           // vf03.x = -q.z
+		VADDbc_C2(0x4, 3, 0, 5, kBcW),                           // vf03.y = +q.w
+		VADDbc_C2(0x2, 3, 0, 5, kBcX),                           // vf03.z = +q.x
+		VSUBbc_C2(0x1, 3, 0, 0, kBcW),                           // vf03.w = 0
+		VADDbc_C2(0x8, 4, 0, 5, kBcY),                           // vf04.x = +q.y
+		VSUBbc_C2(0x4, 4, 0, 5, kBcX),                           // vf04.y = -q.x
+		VADDbc_C2(0x2, 4, 0, 5, kBcW),                           // vf04.z = +q.w
+		VSUBbc_C2(0x1, 4, 0, 0, kBcW),                           // vf04.w = 0
+		VOPMULA_C2(0xE, /*fs*/6, /*ft*/2),                       // ACC = 2q x c0 terms
+		VOPMSUB_C2(0xE, /*fd*/2, /*fs*/2, /*ft*/6),              // vf02 = ACC - c0 x 2q
+		VOPMULA_C2(0xE, 6, 3),
+		VOPMSUB_C2(0xE, 3, 3, 6),
+		VOPMULA_C2(0xE, 6, 4),
+		VOPMSUB_C2(0xE, 4, 4, 6),
+		VADDbc_C2(0x8, 2, 2, 0, kBcW),                           // vf02.x += 1.0
+		VADDbc_C2(0x4, 3, 3, 0, kBcW),                           // vf03.y += 1.0
+		VADDbc_C2(0x2, 4, 4, 0, kBcW),                           // vf04.z += 1.0
+		VMULx_C2(0xF, 2, 2, 1),                                  // vf02 *= scale.x
+		VMULy_C2(0xF, 3, 3, 1),                                  // vf03 *= scale.y
+		VMULz_C2(0xF, 4, 4, 1),                                  // vf04 *= scale.z
+		VMULAx_C2 (0xF, /*fs*/7, /*ft*/2),                       // ACC  = M0*b0.x
+		VMADDAy_C2(0xF, 8, 2),                                   // ACC += M1*b0.y
+		VMADDAz_C2_(0xF, 9, 2),                                  // ACC += M2*b0.z
+		VMADDw_C2(0xF, /*fd*/11, /*fs*/10, /*ft*/2),             // vf11 = ACC + M3*b0.w
+		VMULAx_C2 (0xF, 7, 3),
+		VMADDAy_C2(0xF, 8, 3),
+		VMADDAz_C2_(0xF, 9, 3),
+		VMADDw_C2(0xF, 12, 10, 3),
+		VMULAx_C2 (0xF, 7, 4),
+		VMADDAy_C2(0xF, 8, 4),
+		VMADDAz_C2_(0xF, 9, 4),
+		VMADDw_C2(0xF, 13, 10, 4),
+		VMULAx_C2 (0xF, 7, 15),
+		VMADDAy_C2(0xF, 8, 15),
+		VMADDAz_C2_(0xF, 9, 15),
+		VMADDw_C2(0xF, 14, 10, 0),                               // vf14 = ACC + M3*1.0
+		SQC2(11, reg::a2, 0x00),
+		SQC2(12, reg::a2, 0x10),
+		SQC2(13, reg::a2, 0x20),
+		SQC2(14, reg::a2, 0x30),
+	});
+	h.Run();
+
+	// The harness auto-diff compares full state; pin the transform outputs
+	// explicitly so a divergence names the lane.
+	for (u32 vf : {2u, 3u, 4u, 6u, 11u, 12u, 13u, 14u})
+		for (char l : {'x', 'y', 'z', 'w'})
+			EXPECT_EQ(h.GetVu0VfBitsJit(vf, l), h.GetVu0VfBitsInterp(vf, l))
+				<< "vf" << vf << "." << l;
 }
 
 } // namespace recompiler_tests

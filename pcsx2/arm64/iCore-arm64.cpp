@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Config.h"
@@ -53,7 +53,21 @@ static uint g_arm64checknext = 0;
 _arm64neonregs arm64neon[NUM_ARM_NEON_REGS], s_saveArm64NEONregs[NUM_ARM_NEON_REGS];
 
 // ARM64 register allocation policy (EE-SRA 3 Arm D tier-2 re-home):
-// x0-x3:   argument/return registers (caller-saved, allocatable)
+// x0-x1:   RWARG1/RWARG2 — NOT allocatable for EE (reserved as pure scratch
+//          so the scalar-ALU helpers' RWARG temps + fallback loads never
+//          collide with an allocator-resident guest value; this is what makes
+//          the GE-M2 resident-scalar-ALU path safe). Still IOP-allocatable
+//          (IOP codegen has its own RWARG discipline and is left
+//          byte-identical — see IOP_ALLOCATABLE_MASK below).
+// x2-x3:   RWARG3/RWARG4 — NOT allocatable for EE (same rationale as x0/x1:
+//          they are C-call argument registers AND are used as hardcoded scratch
+//          by hand-emitted EE codegen — e.g. the iCOP2 VU-flag/interlock ops —
+//          which was harmless while nothing was allocator-resident but clobbers
+//          a live GE-M2 resident scalar once the RC0 flip holds sources across
+//          ops. The Arm D tier-2 re-home vacated w4-w7 scratch but NOT w2/w3
+//          (they stayed arg registers), so unlike x4-x7 these can still be
+//          scratch-clobbered — carve them out. Still IOP-allocatable, like
+//          x0/x1 — see IOP_ALLOCATABLE_MASK below.)
 // x4-x7:   caller-saved temporaries (allocatable; vacated by the Arm D
 //          tier-2 re-home — S3's 0f16948ae removed every hardcoded w4-w7
 //          scratch use, so nothing conflicts with allocator residency)
@@ -93,6 +107,7 @@ _arm64neonregs arm64neon[NUM_ARM_NEON_REGS], s_saveArm64NEONregs[NUM_ARM_NEON_RE
 // Bitmask of allocatable aarch64 GPRs for EE-side codegen (EE/VU-macro/
 // temps). Bit `n` set ↔ x_n is in the pool. Cleared bits as documented
 // above:
+//   bits 0-3    — x0-x3 : RWARG1-4 reserved as pure EE scratch/arg regs (GE-M2)
 //   bit 8       — x8  : RXSCRATCH/RWSCRATCH (value scratch)
 //   bits 9-10   — x9/x10 : load/store address + value scratch
 //   bits 11-13  — x11/x12/x13 : REEPIN_AT/REEPIN_K0/REEPIN_S0 (tier-2
@@ -110,7 +125,9 @@ _arm64neonregs arm64neon[NUM_ARM_NEON_REGS], s_saveArm64NEONregs[NUM_ARM_NEON_RE
 // Inner allocator loop runs 31× per cache miss and was nine sequential
 // `if (armreg == N) return false` branches per probe; collapse to one
 // LSR + AND + cbz against this mask.
-static constexpr uint32_t EE_ALLOCATABLE_MASK = ~((1u << 8)
+static constexpr uint32_t EE_ALLOCATABLE_MASK = ~((3u << 0)
+	| (3u << 2)
+	| (1u << 8)
 	| (1u << 9) | (1u << 10)
 	| (7u << 11)
 	| (7u << 16)
@@ -132,7 +149,7 @@ static constexpr uint32_t EE_ALLOCATABLE_MASK = ~((1u << 8)
 // Shared TEMP allocations always use the EE mask (restrictive = safe for
 // both CPUs).
 static constexpr uint32_t IOP_ALLOCATABLE_MASK =
-	EE_ALLOCATABLE_MASK | (7u << 11) | (1u << 26) | (1u << 27);
+	EE_ALLOCATABLE_MASK | (3u << 0) | (3u << 2) | (7u << 11) | (1u << 26) | (1u << 27);
 
 bool _isAllocatableArm64GPR(int armreg)
 {
@@ -181,37 +198,45 @@ int _getFreeArm64GPR(int mode, u32 pool)
 		return reg;
 	}
 
-	// Second pass: evict by LRU, prefer temps first
-	for (int i = 0; i < NUM_ARM_GPR_REGS; i++)
+	// Second pass: evict by LRU, prefer temps first. Loop-pinned entries
+	// (SL-1) are skipped in the first sweep — evicting one costs a reload at
+	// the back-edge reconcile — but remain fair game in the fallback sweep so
+	// allocation can never fail on their account.
+	for (const bool allow_looppin : {false, true})
 	{
-		if (!((pool >> i) & 1u))
-			continue;
-		if ((mode & MODE_CALLEESAVED) && !armIsCalleeSavedRegister(i))
-			continue;
-		if ((mode & MODE_COP2) && mVUIsReservedCOP2(i))
-			continue;
-
-		pxAssert(arm64gprs[i].inuse);
-		if (arm64gprs[i].needed)
-			continue;
-
-		if (arm64gprs[i].type == ARM64TYPE_TEMP)
+		for (int i = 0; i < NUM_ARM_GPR_REGS; i++)
 		{
-			_freeArm64GPR(i);
-			return i;
+			if (!((pool >> i) & 1u))
+				continue;
+			if ((mode & MODE_CALLEESAVED) && !armIsCalleeSavedRegister(i))
+				continue;
+			if ((mode & MODE_COP2) && mVUIsReservedCOP2(i))
+				continue;
+
+			pxAssert(arm64gprs[i].inuse);
+			if (arm64gprs[i].needed)
+				continue;
+			if (arm64gprs[i].looppin && !allow_looppin)
+				continue;
+
+			if (arm64gprs[i].type == ARM64TYPE_TEMP)
+			{
+				_freeArm64GPR(i);
+				return i;
+			}
+
+			if (arm64gprs[i].counter < bestcount)
+			{
+				tempi = i;
+				bestcount = arm64gprs[i].counter;
+			}
 		}
 
-		if (arm64gprs[i].counter < bestcount)
+		if (tempi != -1)
 		{
-			tempi = i;
-			bestcount = arm64gprs[i].counter;
+			_freeArm64GPR(tempi);
+			return tempi;
 		}
-	}
-
-	if (tempi != -1)
-	{
-		_freeArm64GPR(tempi);
-		return tempi;
 	}
 
 	pxFailRel("ARM64 GPR register allocation error");
@@ -224,12 +249,12 @@ void _writebackArm64GPR(int armreg)
 	{
 		case ARM64TYPE_GPR:
 			RALOG("Writing back ARM64 GPR %d for guest reg %d\n", armreg, arm64gprs[armreg].reg);
-			armStoreEERegPtr(armXRegister(armreg), &cpuRegs.GPR.r[arm64gprs[armreg].reg].UD[0]);
+			armStoreEERegPtrRaw(armXRegister(armreg), &cpuRegs.GPR.r[arm64gprs[armreg].reg].UD[0]);
 			break;
 
 		case ARM64TYPE_FPRC:
 			RALOG("Writing back ARM64 GPR %d for guest FPCR %d\n", armreg, arm64gprs[armreg].reg);
-			armStoreEERegPtr(armWRegister(armreg), &fpuRegs.fprc[arm64gprs[armreg].reg]);
+			armStoreEERegPtrRaw(armWRegister(armreg), &fpuRegs.fprc[arm64gprs[armreg].reg]);
 			break;
 
 		case ARM64TYPE_VIREG:
@@ -268,6 +293,7 @@ void _freeArm64GPR(int armreg)
 
 	arm64gprs[armreg].inuse = 0;
 	arm64gprs[armreg].mode = 0;
+	arm64gprs[armreg].looppin = 0;
 }
 
 void _freeArm64GPRWithoutWriteback(int armreg)
@@ -275,6 +301,7 @@ void _freeArm64GPRWithoutWriteback(int armreg)
 	pxAssert(armreg >= 0 && armreg < NUM_ARM_GPR_REGS);
 	arm64gprs[armreg].inuse = 0;
 	arm64gprs[armreg].mode = 0;
+	arm64gprs[armreg].looppin = 0;
 }
 
 void _freeArm64GPRregs()
@@ -319,6 +346,16 @@ int _allocArm64GPR(int type, int reg, int mode)
 	if (type == ARM64TYPE_GPR || type == ARM64TYPE_PSX)
 		pxAssertMsg(reg >= 0 && reg < 34, "Register index out of bounds.");
 
+	// GE-M2 I1, enforced at the CREATION site: a pinned guest reg's lower 64
+	// bits live in its mirror register, so it must never get a scalar
+	// ARM64TYPE_GPR home — under the resident-ALU templates the slot would
+	// persist while pin-preferring readers (_eeGetGPRSourceReg) keep serving
+	// the stale mirror (the UYA unaligned-load corruption, 2026-07-17).
+	// _validateRegs checks the same invariant but only runs at XMM-template
+	// entry; this catches the offender in its own backtrace.
+	if (type == ARM64TYPE_GPR)
+		pxAssertMsg(!armEEPinForGPR(reg), "allocating scalar slot for pinned guest reg (GE-M2 I1)");
+
 	int hostNEONreg = (type == ARM64TYPE_GPR) ? _checkNEONreg(NEONTYPE_GPRREG, reg, 0) : -1;
 
 	// Check if already allocated
@@ -360,19 +397,19 @@ int _allocArm64GPR(int type, int reg, int mode)
 	// EE guest state, VI mirrors, and shared TEMPs — stays inside the EE
 	// mask so it can never land on an EE pin host.
 	//
-	// FPRC (FCR31 residency, GE-12) gets a further-restricted pool: x0/x1
-	// are raw-clobbered as RWARG1/RWARG2 scratch by FPU/MULT emitters with
-	// no allocator free, and x28 doubles as COP2 macro-mode VI-pool
-	// spillover (mVUIsReservedCOP2 is a stub, and the COP2 wrappers' light
-	// iFlushCall only evicts caller-saved homes) plus the sole
-	// MODE_CALLEESAVED candidate for the vtlb unaligned handlers. A flag
+	// FPRC (FCR31 residency, GE-12) gets a further-restricted pool: the base
+	// EE mask already excludes x0/x1 (carved as pure RWARG1/RWARG2 scratch —
+	// GE-M2), so FPRC only needs to additionally drop x28, which doubles as
+	// COP2 macro-mode VI-pool spillover (mVUIsReservedCOP2 is a stub, and the
+	// COP2 wrappers' light iFlushCall only evicts caller-saved homes) plus the
+	// sole MODE_CALLEESAVED candidate for the vtlb unaligned handlers. A flag
 	// register that persists across ops must live where neither habit can
 	// touch it: {x2-x7, x14, x15} — all caller-saved, so every iFlushCall
 	// seam writes it back before C code can observe or mutate fprc[31].
 	const u32 pool = (type == ARM64TYPE_PSX || type == ARM64TYPE_PSX_PCWRITEBACK)
 	                     ? IOP_ALLOCATABLE_MASK
 	                 : (type == ARM64TYPE_FPRC)
-	                     ? (EE_ALLOCATABLE_MASK & ~((1u << 0) | (1u << 1) | (1u << 28)))
+	                     ? (EE_ALLOCATABLE_MASK & ~(1u << 28))
 	                     : EE_ALLOCATABLE_MASK;
 	const int regnum = _getFreeArm64GPR(mode, pool);
 	arm64gprs[regnum].type = type;
@@ -415,14 +452,14 @@ int _allocArm64GPR(int type, int reg, int mode)
 				else
 				{
 					RALOG("Loading guest reg %d to GPR %d\n", reg, regnum);
-					armLoadEERegPtr(armXRegister(regnum), &cpuRegs.GPR.r[reg].UD[0]);
+					armLoadEERegPtrRaw(armXRegister(regnum), &cpuRegs.GPR.r[reg].UD[0]);
 				}
 			}
 			break;
 
 			case ARM64TYPE_FPRC:
 				RALOG("Loading guest FPCR %d to GPR %d\n", reg, regnum);
-				armLoadEERegPtr(armWRegister(regnum), &fpuRegs.fprc[reg]);
+				armLoadEERegPtrRaw(armWRegister(regnum), &fpuRegs.fprc[reg]);
 				break;
 
 			case ARM64TYPE_PSX:
@@ -510,7 +547,7 @@ void _flushConstReg(int reg)
 		const vixl::aarch64::Register* pin = armEEPinForGPR(reg);
 		const vixl::aarch64::Register& dst = pin ? *pin : RXSCRATCH;
 		armAsm->Mov(dst, static_cast<s64>(g_cpuConstRegs[reg].SD[0]));
-		armStoreEERegPtr(dst, &cpuRegs.GPR.r[reg].UD[0]);
+		armStoreEERegPtrRaw(dst, &cpuRegs.GPR.r[reg].UD[0]);
 		g_cpuFlushedConstReg |= (1 << reg);
 		if (reg == 0)
 			DevCon.Warning("Flushing r0!");
@@ -529,7 +566,7 @@ void _flushConstRegs(bool delete_const)
 		const vixl::aarch64::Register* pin = armEEPinForGPR(static_cast<int>(i));
 		const vixl::aarch64::Register& dst = pin ? *pin : RXSCRATCH;
 		armAsm->Mov(dst, static_cast<u64>(g_cpuConstRegs[i].UD[0]));
-		armStoreEERegPtr(dst, &cpuRegs.GPR.r[i].UD[0]);
+		armStoreEERegPtrRaw(dst, &cpuRegs.GPR.r[i].UD[0]);
 		g_cpuFlushedConstReg |= 1u << i;
 	}
 
@@ -572,6 +609,16 @@ void _validateRegs()
 
 		if ((gprmode | neonmode) & MODE_WRITE)
 			pxAssertMsg((gprmode & MODE_WRITE) != (neonmode & MODE_WRITE), "only one of GPR/NEON is in write state");
+
+		// I1 (GE-M2): a pinned guest reg's lower 64 bits live in its mirror
+		// register (kEEPinTable), so it must never ALSO get a scalar
+		// ARM64TYPE_GPR home — that would be a second, conflicting lower-64
+		// residence. (A 128-bit NEON quad home IS allowed: the pin mirrors only
+		// the lower 64 and armMergeEEPinIntoQuad / armStoreEEGPRQuad keep lane 0
+		// coherent with it — that is exactly the MMI-quad-on-a-pinned-reg case.)
+		if (armEEPinForGPR(guestreg) != nullptr)
+			pxAssertMsg(gprmode == 0,
+				"GE-M2 I1: pinned guest reg must not be scalar allocator-resident");
 	}
 #endif
 }
@@ -662,7 +709,21 @@ static constexpr u32 NEON_RESERVED_FPU_MAX = 8;
 static constexpr u32 NEON_RESERVED_FPU_MIN = 9;
 
 // (The callee-saved allocator range q10-q15 is declared in iCore-arm64.h —
-// NEON_CALLEE_SAVED_START/END; indices 8/9 reserved above.)
+// NEON_CALLEE_SAVED_START/END; indices 8/9 reserved above. SL-13 reserves
+// q25/q26 the same way for the COP2 clamp-constant broadcasts —
+// NEON_RESERVED_COP2_CLAMPMAX/MIN in iCore-arm64.h.)
+static bool _isReservedNEONreg(u32 i)
+{
+	return i == NEON_RESERVED_FPU_MAX || i == NEON_RESERVED_FPU_MIN ||
+	       i == NEON_RESERVED_COP2_CLAMPMAX || i == NEON_RESERVED_COP2_CLAMPMIN;
+}
+
+#ifdef PCSX2_RECOMPILER_TESTS
+bool eeTestNeonRegIsReserved(int hostreg)
+{
+	return _isReservedNEONreg(static_cast<u32>(hostreg));
+}
+#endif
 
 // Free-slot-only probe of a range: no eviction, -1 when the range is full.
 // Used by the FPR-class allocators to PREFER a call-surviving home (GE-15)
@@ -672,7 +733,7 @@ static int _getFreeArm64NEONInRangeNoEvict(u32 minreg, u32 maxreg)
 {
 	for (u32 i = minreg; i < maxreg; i++)
 	{
-		if (i == NEON_RESERVED_FPU_MAX || i == NEON_RESERVED_FPU_MIN)
+		if (_isReservedNEONreg(i))
 			continue;
 		if (!arm64neon[i].inuse)
 			return static_cast<int>(i);
@@ -688,7 +749,7 @@ int _getFreeArm64NEON(u32 minreg, u32 maxreg)
 	// Check for free registers
 	for (u32 i = minreg; i < maxreg; i++)
 	{
-		if (i == NEON_RESERVED_FPU_MAX || i == NEON_RESERVED_FPU_MIN)
+		if (_isReservedNEONreg(i))
 			continue;
 		if (!arm64neon[i].inuse)
 			return i;
@@ -699,7 +760,7 @@ int _getFreeArm64NEON(u32 minreg, u32 maxreg)
 	bestcount = 0xffff;
 	for (u32 i = minreg; i < maxreg; i++)
 	{
-		if (i == NEON_RESERVED_FPU_MAX || i == NEON_RESERVED_FPU_MIN)
+		if (_isReservedNEONreg(i))
 			continue;
 		pxAssert(arm64neon[i].inuse);
 		if (arm64neon[i].needed)
@@ -740,7 +801,7 @@ int _getFreeArm64NEON(u32 minreg, u32 maxreg)
 	bestcount = 0xffff;
 	for (u32 i = minreg; i < maxreg; i++)
 	{
-		if (i == NEON_RESERVED_FPU_MAX || i == NEON_RESERVED_FPU_MIN)
+		if (_isReservedNEONreg(i))
 			continue;
 		pxAssert(arm64neon[i].inuse);
 		if (arm64neon[i].needed)
@@ -842,7 +903,7 @@ int _allocFPtoNEONreg(int fpreg, int mode)
 
 	if (mode & MODE_READ)
 	{
-		armLoadEERegPtr(armSRegister(neonreg), &fpuRegs.fpr[fpreg].f);
+		armLoadEERegPtrRaw(armSRegister(neonreg), &fpuRegs.fpr[fpreg].f);
 	}
 
 	return neonreg;
@@ -900,7 +961,7 @@ int _allocGPRtoNEONreg(int gprreg, int mode)
 		else if (GPR_IS_CONST1(gprreg))
 		{
 			// Load full 128 bits from memory, replace lower 64 with constant
-			armLoadEERegPtr(armQRegister(neonreg), &cpuRegs.GPR.r[gprreg].UQ);
+			armLoadEERegPtrRaw(armQRegister(neonreg), &cpuRegs.GPR.r[gprreg].UQ);
 			armAsm->Mov(RXSCRATCH, static_cast<s64>(g_cpuConstRegs[gprreg].SD[0]));
 			armAsm->Ins(armQRegister(neonreg).V2D(), 0, RXSCRATCH);
 			arm64neon[neonreg].mode |= MODE_WRITE;
@@ -912,7 +973,7 @@ int _allocGPRtoNEONreg(int gprreg, int mode)
 		else if (hostGPRreg >= 0)
 		{
 			// Load full 128, replace lower if dirty
-			armLoadEERegPtr(armQRegister(neonreg), &cpuRegs.GPR.r[gprreg].UQ);
+			armLoadEERegPtrRaw(armQRegister(neonreg), &cpuRegs.GPR.r[gprreg].UQ);
 			if (arm64gprs[hostGPRreg].mode & MODE_WRITE)
 			{
 				armAsm->Ins(armQRegister(neonreg).V2D(), 0, armXRegister(hostGPRreg));
@@ -922,7 +983,7 @@ int _allocGPRtoNEONreg(int gprreg, int mode)
 		}
 		else
 		{
-			armLoadEERegPtr(armQRegister(neonreg), &cpuRegs.GPR.r[gprreg].UQ);
+			armLoadEERegPtrRaw(armQRegister(neonreg), &cpuRegs.GPR.r[gprreg].UQ);
 			// Lazy-dirty: a dirty pin makes the memory lower half stale.
 			armMergeEEPinIntoQuad(armQRegister(neonreg), gprreg);
 		}
@@ -934,6 +995,36 @@ int _allocGPRtoNEONreg(int gprreg, int mode)
 		_freeArm64GPRWithoutWriteback(hostGPRreg);
 
 	return neonreg;
+}
+
+// GE-M2 residency merge for a RAW quad load from cpuRegs memory (the SQ /
+// QMFC2 / MMI memory-path loads that build a 128-bit value in a scratch NEON
+// register rather than allocating one via _allocGPRtoNEONreg). The canonical
+// lower 64 bits may be stale relative to a dirty pin mirror OR a dirty scalar
+// ARM64TYPE_GPR slot (a resident lower-64 write the flip has not flushed yet);
+// Ins the newest lower 64 into lane 0. Pin and scalar slot are mutually
+// exclusive (invariant I1), so at most one branch fires. The upper 64 bits are
+// never mirrored, so memory is always current for them. Side-effect-free: it
+// does not bump the allocator LRU or touch `needed`, so a following consumer of
+// the scalar slot is unaffected. Superset of armMergeEEPinIntoQuad — replaces it
+// at the raw quad-load sites; the pin-only variant stays where a scalar slot is
+// structurally impossible (inside _allocGPRtoNEONreg's no-scalar branch).
+void armMergeEEResidentIntoQuad(const vixl::aarch64::VRegister& q, int gpr)
+{
+	if (const vixl::aarch64::Register* pin = armEEPinForGPR(gpr))
+	{
+		armAsm->Ins(q.V2D(), 0, *pin);
+		return;
+	}
+	for (int i = 0; i < NUM_ARM_GPR_REGS; i++)
+	{
+		if (arm64gprs[i].inuse && arm64gprs[i].type == ARM64TYPE_GPR &&
+			arm64gprs[i].reg == gpr && (arm64gprs[i].mode & MODE_WRITE))
+		{
+			armAsm->Ins(q.V2D(), 0, armXRegister(i));
+			return;
+		}
+	}
 }
 
 int _allocFPACCtoNEONreg(int mode)
@@ -968,7 +1059,7 @@ int _allocFPACCtoNEONreg(int mode)
 
 	if (mode & MODE_READ)
 	{
-		armLoadEERegPtr(armSRegister(neonreg), &fpuRegs.ACC.f);
+		armLoadEERegPtrRaw(armSRegister(neonreg), &fpuRegs.ACC.f);
 	}
 
 	return neonreg;
@@ -1029,13 +1120,13 @@ void _writebackNEONreg(int neonreg)
 
 		case NEONTYPE_FPREG:
 		{
-			armStoreEERegPtr(armSRegister(neonreg), &fpuRegs.fpr[arm64neon[neonreg].reg].f);
+			armStoreEERegPtrRaw(armSRegister(neonreg), &fpuRegs.fpr[arm64neon[neonreg].reg].f);
 		}
 		break;
 
 		case NEONTYPE_FPACC:
 		{
-			armStoreEERegPtr(armSRegister(neonreg), &fpuRegs.ACC.f);
+			armStoreEERegPtrRaw(armSRegister(neonreg), &fpuRegs.ACC.f);
 		}
 		break;
 

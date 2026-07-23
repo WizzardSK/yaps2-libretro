@@ -37,8 +37,11 @@ add_pcsx2_test(recompiler_tests
 	arm64_baseblocks_link_tests.cpp
 	ee_rec_alu_tests.cpp
 	ee_rec_alu64_tests.cpp
+	ee_rec_fuzz_tests.cpp
 	ee_rec_alu_imm_tests.cpp
 	ee_rec_branch_tests.cpp
+	ee_rec_loop_residency_tests.cpp
+	ee_rec_superblock_tests.cpp
 	ee_rec_branch_in_delay_tests.cpp
 	ee_rec_callret_tests.cpp
 	ee_rec_cop0_tests.cpp
@@ -47,6 +50,7 @@ add_pcsx2_test(recompiler_tests
 	ee_rec_fpu_guardbit_tests.cpp
 	ee_rec_fpu_rsqrt_tests.cpp
 	ee_rec_harness_validation_tests.cpp
+	ee_rec_gem2_coherence_tests.cpp
 	ee_rec_iop_handoff_tests.cpp
 	ee_rec_jump_tests.cpp
 	ee_rec_loadstore_tests.cpp
@@ -64,6 +68,7 @@ add_pcsx2_test(recompiler_tests
 	ee_rec_smc_tests.cpp
 	ee_rec_timeout_loop_tests.cpp
 	ee_rec_traps_tests.cpp
+	ee_timer_count_read_race_tests.cpp
 	vtlb_get_guest_address_tests.cpp
 	vu0_harness_validation_tests.cpp
 	vu0_alu_upper_tests.cpp
@@ -72,6 +77,7 @@ add_pcsx2_test(recompiler_tests
 	vu0_integer_alu_tests.cpp
 	vu0_branch_delay_tests.cpp
 	vu0_flag_pipeline_tests.cpp
+	vu0_flag_link_reorder_tests.cpp
 	vu_end_program_status_broadcast_tests.cpp
 	vu0_e_d_t_m_bit_tests.cpp
 	vu0_clamp_modes_tests.cpp
@@ -80,6 +86,8 @@ add_pcsx2_test(recompiler_tests
 	vu_overflow_hack_tests.cpp
 	ee_vu0_cfc2_ctc2_tests.cpp
 	ee_vu0_qmfc2_qmtc2_tests.cpp
+	ee_vu0_cop2_transfer_residency_tests.cpp
+	ee_vu0_cop2_clamp_residency_tests.cpp
 	ee_vu0_cop2_macro_tests.cpp
 	vu1_alu_upper_tests.cpp
 	vu1_alu_lower_tests.cpp
@@ -92,6 +100,7 @@ add_pcsx2_test(recompiler_tests
 	mvu_cache_exhaustion_tests.cpp
 	mvu_lpstate_invariant_tests.cpp
 	mvu_resume_dispatch_tests.cpp
+	mvu_spin_ff_tests.cpp
 	mvu_contentmap_drift_tests.cpp
 	mvu_lane_fmul_fold_tests.cpp
 	mvu_abi_digest_tests.cpp

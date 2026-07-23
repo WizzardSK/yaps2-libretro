@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
 // ARM64 EE FPU (COP1) Instruction Codegen — NEON-based
@@ -102,7 +102,10 @@ void recCFC1()
 		armLoadEERegPtr(RWSCRATCH, &fpuRegs.fprc[0]);
 		armAsm->Sxtw(RXSCRATCH, RWSCRATCH);
 	}
-	armStoreEERegPtr(RXSCRATCH, &cpuRegs.GPR.r[_Rt_].UD[0]);
+	// Deposit last, after any FCR31 slot allocation above: the dest home is
+	// resolved at the store so an allocator-resident rt slot can't be evicted
+	// between resolve and use.
+	_eeStoreGPRDestReg(_Rt_, RXSCRATCH);
 }
 
 //------------------------------------------------------------------
@@ -122,14 +125,15 @@ void recCTC1()
 	}
 	else
 	{
+		a64::Register rt = RWSCRATCH;
 		if (GPR_IS_CONST1(_Rt_))
 			armAsm->Mov(RWSCRATCH, g_cpuConstRegs[_Rt_].UL[0]);
 		else
 		{
 			_deleteEEreg(_Rt_, 1);
-			armLoadEERegPtr(RWSCRATCH, &cpuRegs.GPR.r[_Rt_].UL[0]);
+			rt = _eeGetGPRSourceReg(RWSCRATCH, _Rt_);
 		}
-		armStoreEERegPtr(RWSCRATCH, &fpuRegs.fprc[_Fs_]);
+		armStoreEERegPtr(rt, &fpuRegs.fprc[_Fs_]);
 	}
 }
 
@@ -159,7 +163,8 @@ void recMFC1()
 		armLoadEERegPtr(RWSCRATCH, &fpuRegs.fpr[_Fs_].UL);
 	}
 	armAsm->Sxtw(RXSCRATCH, RWSCRATCH);
-	armStoreEERegPtr(RXSCRATCH, &cpuRegs.GPR.r[_Rt_].UD[0]);
+	// Deposit last, after the FPR-slot probe above (see recCFC1).
+	_eeStoreGPRDestReg(_Rt_, RXSCRATCH);
 }
 
 //------------------------------------------------------------------
@@ -167,12 +172,13 @@ void recMFC1()
 //------------------------------------------------------------------
 void recMTC1()
 {
+	a64::Register rt = RWSCRATCH;
 	if (GPR_IS_CONST1(_Rt_))
 		armAsm->Mov(RWSCRATCH, g_cpuConstRegs[_Rt_].UL[0]);
 	else
 	{
 		_deleteEEreg(_Rt_, 1);
-		armLoadEERegPtr(RWSCRATCH, &cpuRegs.GPR.r[_Rt_].UL[0]);
+		rt = _eeGetGPRSourceReg(RWSCRATCH, _Rt_);
 	}
 
 	// If fpr[fs] is already resident in NEON, write the new bits straight into
@@ -190,11 +196,11 @@ void recMTC1()
 		fsreg = _allocIfUsedFPUtoNEON(_Fs_, MODE_WRITE);
 	if (fsreg >= 0)
 	{
-		armAsm->Fmov(armSRegister(fsreg), RWSCRATCH);
+		armAsm->Fmov(armSRegister(fsreg), rt);
 	}
 	else
 	{
-		armStoreEERegPtr(RWSCRATCH, &fpuRegs.fpr[_Fs_].UL);
+		armStoreEERegPtr(rt, &fpuRegs.fpr[_Fs_].UL);
 	}
 }
 
@@ -413,6 +419,26 @@ static a64::VRegister fpuClampInput(const a64::VRegister& src, const a64::VRegis
 	return scratch;
 }
 
+// Source-operand clamp for MAX.S / MIN.S. Identical sign-preserving inf/NaN ->
+// ±fMax to fpuClampInput, but gated on CHECK_FPU_OVERFLOW (eeClampMode >= 1)
+// instead of CHECK_FPU_EXTRA_OVERFLOW (>= 2). x86 routes MAX/MIN through
+// recCommutativeOp with op>=2, whose gate `CHECK_FPU_EXTRA_OVERFLOW || (op>=2)`
+// is always true, so it fpuFloat2-clamps both operands whenever CHECK_FPU_OVERFLOW
+// — a strictly lower threshold than the arithmetic ops. AetherSX2's shipped arm64
+// rec gates the same MAX/MIN clamp on fpuOverflow (options bit 8) vs ADD/SUB's
+// bit 8+9 (verified by disassembly of the 3606 build). Without it a raw Inf/NaN
+// operand (via MOV.S/LWC1/MTC1) survives the NaN-eating Fmaxnm/Fminnm as the
+// wrong finite value — the True Crime: New York City rainbow. Off (mode 0)
+// returns the source reg and emits nothing.
+static a64::VRegister fpuClampMinMaxOperand(const a64::VRegister& src, const a64::VRegister& scratch)
+{
+	if (!CHECK_FPU_OVERFLOW)
+		return src;
+	armAsm->Fmov(scratch, src);
+	fpuClampCompareOperand(scratch);
+	return scratch;
+}
+
 // PS2 add/sub guard-bit emulation for the single-precision fast path.
 //
 // A compliant IEEE FPU keeps "guard" bits to the right of the mantissa during
@@ -420,11 +446,14 @@ static a64::VRegister fpuClampInput(const a64::VRegister& src, const a64::VRegis
 // left-shifts the mantissa, the bits that would have lived in those guard
 // positions must read as zero on hardware. This masks the low mantissa bits of
 // the smaller-exponent operand by the exponent difference, then does the single
-// op. It is the arm64 fast-path port of x86 FPU_ADD_SUB (iFPU.cpp:402, applied
-// unconditionally in the fast path if FPU_CORRECT_ADD_SUB=1) and reproduces the
-// masking already present in the DOUBLE path's FPU_ADD_SUB (iFPUd-arm64.cpp:200).
-// The CHECK_FPU_FULL (double) config dispatches to that path instead and never
-// reaches here.
+// op. It is the arm64 fast-path port of x86 FPU_ADD_SUB (iFPU.cpp:402). Both
+// JITs gate this masking on the same CHECK_FPU_GUARDED option (x86 FPU_ADD/
+// FPU_SUB, iFPU.cpp) — ON by default (games like True Crime NYC and Jak 3
+// misrender without it, and per-game flagging proved impractical) but opt-out
+// globally for EE-heavy titles that don't need it; see the early-out below. It
+// reproduces the masking already present in the DOUBLE path's FPU_ADD_SUB
+// (iFPUd-arm64.cpp:200); the CHECK_FPU_FULL (double) config dispatches to that
+// path instead and never reaches here (Full mode guards unconditionally).
 //
 // When |expd - expt| <= 1 the mask clears zero bits, so that (common) case skips
 // straight to the plain op. Only |diff| >= 2 masks the smaller-exponent operand;
@@ -448,6 +477,22 @@ static a64::VRegister fpuClampInput(const a64::VRegister& src, const a64::VRegis
 static void fpuEmitGuardedAddSub(const a64::VRegister& dst,
 	const a64::VRegister& s, const a64::VRegister& t, bool issub)
 {
+	// Guard-bit emulation is ON by default (CHECK_FPU_GUARDED) but can be turned
+	// off globally via the fpuGuardedAddSub Recompiler INI bool for EE-FPU-heavy
+	// titles verified to render fine without it. Off = a plain single op, matching
+	// AetherSX2 / PCSX2 v1.0 and the x86 FPU_ADD/FPU_SUB guard-off branch
+	// (iFPU.cpp). Returns before the NEON-temp alloc and GPR-scratch use below so
+	// nothing is booked on the fast path. (Full clamp mode is unaffected either
+	// way: it runs the DOUBLE path, which masks guard bits itself — iFPUd-arm64.cpp.)
+	if (!CHECK_FPU_GUARDED)
+	{
+		if (issub)
+			armAsm->Fsub(dst, s, t);
+		else
+			armAsm->Fadd(dst, s, t);
+		return;
+	}
+
 	// Alloc the NEON temp FIRST, before any raw GPR scratch below goes live.
 	// The alloc can emit a victim eviction whose address materialization uses
 	// scratch (today only x16/x17 via armMoveAddressToReg); keeping w9/w10
@@ -1055,12 +1100,18 @@ void recRSQRT_S()
 		XMMINFO_WRITED | XMMINFO_READS | XMMINFO_READT);
 }
 
-// PS2 FPU has no NaN concept — match x86 MAXSS/MINSS NaN-eating semantics
-// with Fmaxnm/Fminnm (Fmax/Fmin IEEE-propagate NaN, same trap as mVUclamp1).
-// No clamp needed: MAX/MIN cannot widen finite inputs.
+// PS2 FPU has no NaN concept. At eeClampMode >= 1 the operands are first
+// clamped to ±fMax (sign-preserving, via fpuClampMinMaxOperand — matching x86
+// recCommutativeOp's always-firing op>=2 clamp and AetherSX2's arm64 rec), so a
+// raw Inf/NaN operand cannot reach the max/min. The result never needs clamping
+// (max/min of two finite ±fMax-bounded inputs stays in range). Fmaxnm/Fminnm
+// (not Fmax/Fmin, which IEEE-propagate NaN) give MAXSS/MINSS NaN-eating for the
+// unclamped mode-0 case.
 static void recMAX_S_xmm(int info)
 {
-	armAsm->Fmaxnm(armSRegister(EEREC_D), armSRegister(EEREC_S), armSRegister(EEREC_T));
+	const a64::VRegister s = fpuClampMinMaxOperand(armSRegister(EEREC_S), RSSCRATCH);
+	const a64::VRegister t = fpuClampMinMaxOperand(armSRegister(EEREC_T), RSSCRATCH2);
+	armAsm->Fmaxnm(armSRegister(EEREC_D), s, t);
 }
 
 void recMAX_S()
@@ -1071,7 +1122,9 @@ void recMAX_S()
 
 static void recMIN_S_xmm(int info)
 {
-	armAsm->Fminnm(armSRegister(EEREC_D), armSRegister(EEREC_S), armSRegister(EEREC_T));
+	const a64::VRegister s = fpuClampMinMaxOperand(armSRegister(EEREC_S), RSSCRATCH);
+	const a64::VRegister t = fpuClampMinMaxOperand(armSRegister(EEREC_T), RSSCRATCH2);
+	armAsm->Fminnm(armSRegister(EEREC_D), s, t);
 }
 
 void recMIN_S()
