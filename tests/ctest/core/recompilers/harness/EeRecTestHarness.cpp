@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "EeRecTestHarness.h"
@@ -61,6 +61,9 @@ EeRecTestHarness::~EeRecTestHarness()
 
 	if (fpu_mul_hack_changed_)
 		EmuConfig.Gamefixes.FpuMulHack = prev_fpu_mul_hack_;
+
+	if (fpu_guarded_changed_)
+		EmuConfig.Cpu.Recompiler.fpuGuardedAddSub = prev_fpu_guarded_;
 }
 
 void EeRecTestHarness::SetGpr64(u32 reg_idx, u64 value)
@@ -114,6 +117,17 @@ void EeRecTestHarness::EnableFpuMulHack()
 	}
 	EmuConfig.Gamefixes.FpuMulHack = true;
 }
+
+void EeRecTestHarness::DisableFpuGuarded()
+{
+	if (!fpu_guarded_changed_)
+	{
+		prev_fpu_guarded_ = EmuConfig.Cpu.Recompiler.fpuGuardedAddSub;
+		fpu_guarded_changed_ = true;
+	}
+	EmuConfig.Cpu.Recompiler.fpuGuardedAddSub = false;
+}
+
 void EeRecTestHarness::SetStatusBits(u32 mask) { cpuRegs.CP0.n.Status.val |= mask; }
 
 // EE vtlb_memWrite on a direct RAM hit bypasses Cpu->Clear — upstream relies
@@ -229,9 +243,25 @@ void EeRecTestHarness::LoadProgram(std::initializer_list<u32> instructions)
 	LoadProgramImpl(instructions, /*append_term=*/true);
 }
 
+void EeRecTestHarness::LoadProgram(const std::vector<u32>& instructions)
+{
+	program_words_ = instructions;
+	program_words_.push_back(mips::JR(mips::reg::ra));
+	program_words_.push_back(mips::NOP);
+	for (size_t i = 0; i < program_words_.size(); ++i)
+		memWrite32(kProgramPc + static_cast<u32>(i * 4), program_words_[i]);
+}
+
 void EeRecTestHarness::LoadProgramNoTerm(std::initializer_list<u32> instructions)
 {
 	LoadProgramImpl(instructions, /*append_term=*/false);
+}
+
+void EeRecTestHarness::LoadProgramNoTerm(const std::vector<u32>& instructions)
+{
+	program_words_ = instructions;
+	for (size_t i = 0; i < program_words_.size(); ++i)
+		memWrite32(kProgramPc + static_cast<u32>(i * 4), program_words_[i]);
 }
 
 void EeRecTestHarness::SeedEntryState()

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
 #pragma once
@@ -77,7 +77,21 @@
 //       badBranch null jumpAddr) now emit a 5-insn inline flag backup
 //       before jumping to exitFunct; blocks carrying those guards change
 //       shape.
-static constexpr u32 kMvuCompilerAbiVersion = 12;
+//  13 — VU0 spin-wait fast-forward (mVUemitSpinFF): blocks matching the
+//       all-NOP VI-branch spin shapes gain a head sequence (VI compare +
+//       conditional mVU.cycles zeroing ahead of mVUtestCycles) that
+//       consumes the whole remaining grant while the spin holds; spin
+//       blocks change shape.
+//  14 — mVUsetupFlags omits status-flag register self-moves at block links
+//       (getFlagReg(i) == gprF[i], so an identity ring phase was emitting
+//       up to four no-op ORRs; vixl keeps Mov(Wd,Wd) because the 32-bit
+//       move clears bits 63:32); pre-elision link shapes must not be
+//       rehydrated.
+//  15 — E-bit flag validity (mVU.needFlagFinalize): a block reaching a
+//       program end now emits its tail FMAC's flag writes instead of
+//       eliding them, so mVUendProgram finalises a written ring instance;
+//       every block ending in an E-bit changes shape.
+static constexpr u32 kMvuCompilerAbiVersion = 15;
 
 // Hash/equality functors for XXH128_hash_t — let std::unordered_map<XXH128_hash_t, …>
 // work without a wrapping struct. low64 already carries the well-mixed half of
@@ -547,6 +561,19 @@ struct microVU
 	// slot at compile time (XGKICK's C call, end-program emission, the
 	// divtrace per-op hook).
 	int branchCondCarryGpr;
+
+	// Compile-time only (never read by emitted code, so it stays out of the
+	// mVUfieldMem pin window above): set during pass 1 when this block, or a block
+	// its lookahead reaches, ends the program (E-bit). mVUendProgram finalises the
+	// flags into VI[REG_*_FLAG], so the tail FMAC's flag writes must be emitted -
+	// mVUsetFlags' forcing loop reads this alongside __Mac/__Status.
+	//
+	// Deliberately not mVUregs.needExactMatch |= 7 (what upstream x86 does): that
+	// also persists into the successor's pState, forcing exact-match block lookup
+	// and the mVUsetupFlags reorder at every such link. Correctness only needs the
+	// flags computed, not the pipeline pinned, so pinning it buys nothing here and
+	// costs a reorder at every edge that reaches a program end.
+	bool needFlagFinalize;
 
 	VURegs& regs() const { return ::vuRegs[index]; }
 

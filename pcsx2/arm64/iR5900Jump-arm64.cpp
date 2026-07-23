@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
 // ARM64 EE Jump Instruction Codegen
@@ -54,7 +54,7 @@ void recJAL()
 	else
 	{
 		armAsm->Mov(RXSCRATCH, (u64)retpc);
-		armStoreEERegPtr(RXSCRATCH, &cpuRegs.GPR.r[31].UD[0]);
+		_eeStoreGPRDestReg(31, RXSCRATCH);
 	}
 
 	recompileNextInstruction(true, false);
@@ -120,7 +120,7 @@ void recJALR()
 		else
 		{
 			armAsm->Mov(RXSCRATCH, (u64)newpc);
-			armStoreEERegPtr(RXSCRATCH, &cpuRegs.GPR.r[rd].UD[0]);
+			_eeStoreGPRDestReg(rd, RXSCRATCH);
 		}
 	}
 

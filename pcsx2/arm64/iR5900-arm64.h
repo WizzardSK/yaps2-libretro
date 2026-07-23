@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
 #pragma once
@@ -381,7 +381,13 @@ static __fi void armMergeEEPinIntoQuad(const vixl::aarch64::VRegister& q, int gp
 		armAsm->Ins(q.V2D(), 0, *pin);
 }
 
-static __fi void armLoadEERegPtr(const vixl::aarch64::CPURegister& reg, const void* field)
+// GE-M2 superset of armMergeEEPinIntoQuad: also merges a dirty scalar
+// ARM64TYPE_GPR slot (a resident lower-64 write not yet flushed) into lane 0.
+// Used by the raw SQ/QMFC2/MMI quad-load sites so they stay coherent once
+// scalar residency is flipped on. Defined in iCore-arm64.cpp.
+void armMergeEEResidentIntoQuad(const vixl::aarch64::VRegister& q, int gpr);
+
+static __fi void armLoadEERegPtrRaw(const vixl::aarch64::CPURegister& reg, const void* field)
 {
 	// Pinned guest GPR: serve the read from the mirror register. Write-through
 	// keeps mirror == memory; lazy-dirty keeps the mirror NEWEST — either way
@@ -412,7 +418,7 @@ static __fi void armLoadEERegPtr(const vixl::aarch64::CPURegister& reg, const vo
 	else
 		armLoadPtr(reg, field);
 }
-static __fi void armStoreEERegPtr(const vixl::aarch64::CPURegister& reg, const void* field)
+static __fi void armStoreEERegPtrRaw(const vixl::aarch64::CPURegister& reg, const void* field)
 {
 	int off;
 	const EEPinnedGPR* pin = armEEPinForPtr(field, &off);
@@ -483,6 +489,39 @@ static __fi void armStoreEERegPtr(const vixl::aarch64::CPURegister& reg, const v
 	}
 }
 
+#ifdef PCSX2_DEVBUILD
+// GE-M2 coherence tripwire (I3). Fires if `field` is an unpinned guest-GPR
+// lower-64 slot whose reg currently has a DIRTY (MODE_WRITE) allocator or NEON
+// copy — i.e. cpuRegs memory is stale and a raw load/store would desync. Silent
+// on the pre-flip baseline: the memory-based templates flush every reg (free or
+// writeback-clean) before any raw site runs, so nothing is dirty-resident
+// there. Once residency is flipped on (Phases 3/4), a raw guest-GPR site the
+// Phase-1 sweep missed trips this instead of silently corrupting. Dirty-only
+// (not any-residency) so it can NEVER false-fire against a clean read-slot on a
+// user's Devel session; the functional gates (stepdiff/tests/liverun) backstop
+// the rarer raw-write-to-clean-resident corner. Defined in iR5900-arm64.cpp.
+void armAssertRawGPRPtrCoherent(const void* field);
+#endif
+
+// Public guest-GPR memory accessors: the raw canonical load/store plus the
+// Devel coherence tripwire. ALL emitter code uses these; only the register
+// allocator internals (iCore-arm64.cpp writeback/fill/const-flush) may call the
+// *Raw variants directly, since they legitimately operate on resident slots.
+static __fi void armLoadEERegPtr(const vixl::aarch64::CPURegister& reg, const void* field)
+{
+#ifdef PCSX2_DEVBUILD
+	armAssertRawGPRPtrCoherent(field);
+#endif
+	armLoadEERegPtrRaw(reg, field);
+}
+static __fi void armStoreEERegPtr(const vixl::aarch64::CPURegister& reg, const void* field)
+{
+#ifdef PCSX2_DEVBUILD
+	armAssertRawGPRPtrCoherent(field);
+#endif
+	armStoreEERegPtrRaw(reg, field);
+}
+
 // 128-bit guest-GPR store (MMI/NEON writeback, LQ, QMFC2): store the full
 // quad, then refresh the pin mirror from lane 0 when gpr is pinned.
 static __fi void armStoreEEGPRQuad(const vixl::aarch64::VRegister& q, int gpr)
@@ -536,6 +575,18 @@ static __fi void armLd1rVU0(const vixl::aarch64::VRegister& vt, const void* fiel
 }
 
 extern u32 maxrecmem;
+
+// PS2 FPU add/sub guard-bit masking is emitted one of two equivalent ways,
+// chosen at build time by FPU_GUARD_MASK_STUB:
+//   0 = masking inlined into each add/sub block
+//   1 = masking emitted once as a shared stub, reached by a bl
+#ifndef FPU_GUARD_MASK_STUB
+#define FPU_GUARD_MASK_STUB 0
+#endif
+#if FPU_GUARD_MASK_STUB
+extern const void* g_fpuGuardMaskStub;
+#endif
+
 extern u32 pc;             // recompiler pc
 extern int g_branch;       // set for branch
 extern u32 target;         // branch target
@@ -606,6 +657,18 @@ bool TrySwapDelaySlot(u32 rs, u32 rt, u32 rd, bool allow_loadstore);
 void SaveBranchState();
 void LoadBranchState();
 
+// SL-03 superblocks: conditional-fallthrough continuation. The block scanner
+// records forward conditional branches as continuation sites instead of ending
+// the block there. A site's handler queries recSuperblockIsContSite(pc-4) and
+// emits the inverted shape — branch OUT to a cold taken side exit, compile the
+// delay slot inline, and fall through into the rest of the block — instead of
+// the two-arm terminal fork. Side exits snapshot the compile state at the
+// branch and are outlined after the block tail (recEmitPendingSideExits),
+// where each restores its snapshot, compiles the taken-path delay slot, and
+// emits the normal flush + event-check + linked-B tail.
+bool recSuperblockIsContSite(u32 branch_pc);
+vixl::aarch64::Label* recSuperblockAddSideExit(u32 branch_target, bool need_delay_slot);
+
 void recompileNextInstruction(bool delayslot, bool swapped_delay_slot);
 
 // Block-tail transfer for register-indirect targets (recJR/recJALR).
@@ -643,6 +706,67 @@ u32 scaleblockcycles_clear();
 // pass nullptr for "sync only". Emits zero instructions when EEINST analysis
 // flags say no sync is needed.
 void cop2EmitConditionalSync(bool interlock, void (*finishFunc)());
+
+// S4-2: emits the shared VU0-sync stubs cop2EmitConditionalSync BLs into
+// (defined in iCOP2-arm64.cpp). Must run during dispatcher generation,
+// before any block compiles — called from _DynGen_Dispatchers.
+void cop2DynGenSyncStubs();
+
+// (Re)writes _cpuRegistersPack.cop2Rec — the COP2 macro-mode clamp/mask
+// constants the emitters reach via [RSTATE, #imm] (defined in
+// iCOP2-arm64.cpp). Called from recResetRaw before any block compiles.
+void cop2RecWritePackConstants();
+
+// EP-2b: compile-time VF/ACC residency cache for hand-rolled COP2 macro ops
+// (defined in iCOP2-arm64.cpp — see the header comment there for the design
+// and the seam policy). The cache lives in q16..q20 for the duration of runs
+// of cache-aware COP2 ops within one block.
+struct Cop2VfCacheState
+{
+	struct
+	{
+		s8 vf;
+		bool dirty;
+		u32 lastUse;
+	} slot[5];
+	u32 tick;
+};
+void cop2VfCacheReset();                              // block start: clear state (no emission)
+void cop2VfCacheFlush();                              // emit dirty writebacks + invalidate
+Cop2VfCacheState cop2VfCacheGetState();               // fork-tail peek support
+void cop2VfCacheSetState(const Cop2VfCacheState&);
+bool cop2OpPreservesVfCache(u32 code);                // classifier for recompileNextInstruction
+
+// SL-13: compile-time validity of the q25/q26 clamp-constant broadcasts
+// (defined in iCOP2-arm64.cpp — see cop2EnsureClampConsts for the full
+// discipline). Invalidate at every real C-call seam (iFlushCall) and at
+// block start; the flag joins BranchCompileState for forks/side exits;
+// vtlbGetLiveRegisterMasks reads it to make fastmem thunks preserve q25/q26.
+bool cop2ClampConstsValid();
+void cop2ClampConstsSetValid(bool valid);
+void cop2ClampConstsInvalidate();
+
+// RAII: preserve the compile-time COP2 residency state (VF cache + SL-13
+// clamp-const validity) across a branch-fork tail
+// (SetBranchImm/SetBranchImmCall/SetBranchReg) whose iFlushCall destructively
+// flushes — the sibling fork must re-emit its own writebacks from the same
+// pre-tail state, since the cached values stay register-resident along every
+// runtime path (and q25/q26 stay materialized on the not-taken path).
+struct Cop2VfCacheScope
+{
+	Cop2VfCacheState state;
+	bool clampConstsValid;
+	Cop2VfCacheScope()
+		: state(cop2VfCacheGetState())
+		, clampConstsValid(cop2ClampConstsValid())
+	{
+	}
+	~Cop2VfCacheScope()
+	{
+		cop2VfCacheSetState(state);
+		cop2ClampConstsSetValid(clampConstsValid);
+	}
+};
 
 // COP2 macro-mode microVU0 state setup/teardown (defined in microVU-arm64.cpp).
 // Mirrors x86 setupMacroOp/endMacroOp's regAlloc reset, microVU0.cop2 = 1,
@@ -713,9 +837,28 @@ extern u32 g_cpuHasConstReg, g_cpuFlushedConstReg;
 // Move guest GPR value to an ARM64 register
 void _eeMoveGPRtoR(const vixl::aarch64::Register& to, int fromgpr, bool allow_preload = true);
 // Returns a register currently holding the guest GPR (pin / MODE_READ
-// allocator slot — zero insns) or materializes into `scratch`. Post-flush
-// contexts only; consume immediately; never write the result. (EE-SRA 2 WS-C)
+// allocator slot — zero insns) or materializes into `scratch` (const → imm,
+// NEON dual-residence → Fmov, else a memory load). Dirty-safe by construction:
+// a resident slot IS the newest value, and pin / GPR-slot / NEON residency are
+// mutually exclusive (invariants I1/I2), so the pin>slot>fallback order never
+// returns a stale home. Consume immediately; never write the returned register.
+// (EE-SRA 2 WS-C; GE-M2)
 vixl::aarch64::Register _eeGetGPRSourceReg(const vixl::aarch64::Register& scratch, int fromgpr);
+
+// WRITE counterparts (GE-M2). _eeGetGPRDestReg resolves gpr's 64-bit write home
+// — pin > existing ARM64TYPE_GPR slot (marked MODE_WRITE) > [alloc_if_used &&
+// EEINST_USEDTEST(gpr): a fresh MODE_WRITE slot] > `scratch` — after first
+// evicting any 128-bit NEON dual-residence copy WITH writeback (a scalar write
+// only touches UD[0]; UD[1] must survive in memory) and clearing the const
+// flag. _eeStoreGPRDestReg deposits `src` into that home: an allocator slot
+// takes a deferred store (Mov-if-different, then mark MODE_READ|MODE_WRITE so
+// _eeGetGPRSourceReg / seam flushers observe the new value); a pin/memory home
+// takes the lazy-dirty / canonical armStoreEERegPtr (a src that IS the pin
+// emits nothing). Same final-instruction emit-ordering contract as
+// armEEDestForGPR. Mirrors the x86 allocator template
+// (pcsx2/x86/ix86-32/iR5900Templates.cpp, _allocX86reg in pcsx2/x86/iCore.cpp).
+vixl::aarch64::Register _eeGetGPRDestReg(int gpr, const vixl::aarch64::Register& scratch, bool alloc_if_used = false);
+void _eeStoreGPRDestReg(int gpr, const vixl::aarch64::Register& src);
 
 void _eeFlushAllDirty();
 void _eeOnWriteReg(int reg, int signext);

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "microVU-arm64.h"
@@ -2095,6 +2095,16 @@ bool mVUTestProbe_VIPoolUsable(int hostreg, bool cop2mode)
 {
 	microVU0.regAlloc->reset(cop2mode);
 	const bool usable = microVU0.regAlloc->isUsableGPR(hostreg);
+	microVU0.regAlloc->reset(false);
+	return usable;
+}
+
+// SL-13 twin: is host NEON reg q<hostreg> in the VF allocation pool under
+// cop2mode? Macro mode must exclude q25/q26 (EE clamp-constant broadcasts).
+bool mVUTestProbe_NeonPoolUsable(int hostreg, bool cop2mode)
+{
+	microVU0.regAlloc->reset(cop2mode);
+	const bool usable = microVU0.regAlloc->isUsableNeon(hostreg);
 	microVU0.regAlloc->reset(false);
 	return usable;
 }

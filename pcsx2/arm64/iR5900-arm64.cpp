@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
 // ARM64 EE (R5900) Dynamic Recompiler Core
@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "arm64/iR5900-arm64.h"
@@ -82,6 +84,17 @@ static Arm64BaseBlocks recBlocks;
 static u8* recPtr = nullptr;
 static u8* recPtrEnd = nullptr;
 
+// SL-10: cold side-exit arena. Superblock taken arms outline into a separate
+// region carved from the top of the EE cache (below the constant pool) instead
+// of inline after each block's tail — inline placement puts cold bytes between
+// consecutive hot blocks in the compile-order stream, which the S2 device A/B
+// measured as +5.4% EErec icache-miss density. The arena stays inside the EE
+// rec region, so fastmem fault range checks and perf bucketing are unaffected.
+// Bump-allocated; recycled only by the full cache reset, like block memory.
+static u8* s_coldBase = nullptr;
+static u8* s_coldPtr = nullptr;
+static u8* s_coldPtrEnd = nullptr;
+
 static EEINST* s_pInstCache = nullptr;
 static u32 s_nInstCacheSize = 0;
 
@@ -90,6 +103,9 @@ static BASEBLOCKEX* s_pCurBlockEx = nullptr;
 
 static u32 s_nEndBlock = 0;
 static u32 s_branchTo;
+// SL-1: terminal branch class permits a resident back-edge (conditional
+// branches and plain J — not JAL/JR, which own call-ret/indirect tails).
+static bool s_branchLoopable;
 static bool s_nBlockFF;
 
 // Exposed for the LDL/LDR fusion in recVTLB-arm64.cpp (same-block partner check).
@@ -341,11 +357,21 @@ static void verifyCheckPost(u32 code, u32 instPC)
 
 static const void* DispatcherEvent = nullptr;
 static const void* DispatcherReg = nullptr;
+// SL-11: shared tail for cold side exits (pc in RWSCRATCH, cycles in RWARG2):
+// Str pc / Adds cycles / event-exit / Ret. BL'd from each exit so the per-exit
+// tail shrinks to Mov+Mov+BL+linked-B.
+static const void* SuperblockExitStub = nullptr;
 static const void* JITCompile = nullptr;
 static const void* EnterRecompiledCode = nullptr;
 static const void* DispatchBlockDiscard = nullptr;
 static const void* DispatchPageReset = nullptr;
 static const void* UnmappedRecLUTPage = nullptr;
+
+#if FPU_GUARD_MASK_STUB
+// Shared FPU add/sub guard-bit masking stub. Emitted once per dispatcher
+// generation, re-set on cache reset. See iFPU-arm64.cpp.
+const void* g_fpuGuardMaskStub = nullptr;
+#endif
 
 static void recEventTest()
 {
@@ -541,12 +567,58 @@ static const void* _DynGen_UnmappedRecLUTPage()
 	return retval;
 }
 
+#if FPU_GUARD_MASK_STUB
+// Shared PS2 FPU guard-bit masking stub. Branchless, GPR-only; does the masking
+// but not the fadd/fsub, so one stub serves both add and sub (the caller does
+// the op):
+//   in:  w0 = operand A bits, w1 = operand B bits
+//   out: w0 = masked A bits,  w1 = masked B bits
+//   clobbers w0/w1/w8/w9/w10/w16/w17, x30; no NEON, no memory. Leaf (ret x30).
+//
+// ⚠️ Scratches must stay OFF the int-allocator pools: a resident FCR31
+// (ARM64TYPE_FPRC, GE-12) lives in {x2-x7, x14, x15} across ops and is NOT
+// evicted around this call (the caller emits a raw bl, no iFlushCall). The
+// original w2-w6 scratch choice corrupted it — the SotC guard-bit bug; see
+// fpuEmitGuardedAddSub's contract note and the
+// EeRecFpu.CompareSurvivesInterposedGuardedAdd* tests. w8-w10 are the
+// non-allocatable value scratches, w16/w17 the vixl/addr scratches (dead
+// across a bl — veneers may clobber them anyway).
+static const void* _DynGen_FpuGuardMaskStub()
+{
+	u8* retval = armGetCurrentCodePointer();
+	armAsm->Ubfx(a64::w8, a64::w0, 23, 8);              // expA
+	armAsm->Ubfx(a64::w9, a64::w1, 23, 8);              // expB
+	armAsm->Sub(a64::w8, a64::w8, a64::w9);             // diff = expA - expB
+	armAsm->Sub(a64::w9, a64::w8, 1);                   // diff - 1
+	armAsm->Mvn(a64::w10, a64::wzr);                    // 0xffffffff
+	armAsm->Lsl(a64::w9, a64::w10, a64::w9);            // mask B: clear low (diff-1) bits
+	armAsm->Lsl(a64::w16, a64::w10, 31);                // 0x80000000 (sign-only)
+	armAsm->Cmp(a64::w8, 25);
+	armAsm->Csel(a64::w9, a64::w16, a64::w9, a64::ge);  // diff >= 25 -> keep only sign
+	armAsm->And(a64::w9, a64::w1, a64::w9);             // masked-B candidate
+	armAsm->Mvn(a64::w17, a64::w8);                     // ~diff = -diff - 1
+	armAsm->Lsl(a64::w17, a64::w10, a64::w17);          // mask A: clear low (-diff-1) bits
+	armAsm->Cmn(a64::w8, 25);
+	armAsm->Csel(a64::w17, a64::w16, a64::w17, a64::le); // diff <= -25 -> keep only sign
+	armAsm->And(a64::w17, a64::w0, a64::w17);           // masked-A candidate
+	armAsm->Cmp(a64::w8, 0);
+	armAsm->Csel(a64::w1, a64::w9, a64::w1, a64::gt);   // diff > 0 -> B is smaller, mask B
+	armAsm->Csel(a64::w0, a64::w17, a64::w0, a64::lt);  // diff < 0 -> A is smaller, mask A
+	armAsm->Ret();
+	return retval;
+}
+#endif // FPU_GUARD_MASK_STUB
+
 static void _DynGen_Dispatchers()
 {
 	const u8* start = armGetCurrentCodePointer();
 
 	DispatcherEvent = _DynGen_DispatcherEvent();
 	DispatcherReg = _DynGen_DispatcherReg();
+#if FPU_GUARD_MASK_STUB
+	g_fpuGuardMaskStub = _DynGen_FpuGuardMaskStub();
+#endif
+	cop2DynGenSyncStubs();
 
 	JITCompile = _DynGen_JITCompile();
 	EnterRecompiledCode = _DynGen_EnterRecompiledCode();
@@ -590,6 +662,19 @@ static void recError(u32 error)
 
 void iFlushCall(int flushtype)
 {
+	// EP-2b: the COP2 VF residency cache lives in caller-saved q16-q20 and
+	// never survives a C-call seam — write back dirty slots and invalidate
+	// before anything else. Every block tail also funnels through here; the
+	// SetBranch* fork tails restore the compile-time state afterwards
+	// (Cop2VfCacheScope) so each fork emits its own writebacks.
+	cop2VfCacheFlush();
+
+	// SL-13: the callee may clobber the caller-saved q25/q26 clamp-constant
+	// broadcasts — pure compile-time invalidation (constants are clean by
+	// definition; the next clamp site re-materializes with 2 Dups).
+	// Unconditional on flushtype: ANY C call can clobber them.
+	cop2ClampConstsInvalidate();
+
 	// Free caller-saved registers
 	for (int i = 0; i < NUM_ARM_GPR_REGS; i++)
 	{
@@ -962,9 +1047,12 @@ void _eeMoveGPRtoR(const a64::Register& to, int fromgpr, bool allow_preload)
 // slot already in MODE_READ — emitting nothing at all in those cases; only
 // the fallback (const / NEON-resident / memory) materializes into `scratch`.
 // Contract:
-//   - call only where allocator-dirty state has been flushed (post
-//     _eeFlushAllDirty / iFlushCall): a dirty NEON dual-residence copy makes
-//     the pin/memory stale until write-through fires.
+//   - dirty-safe by construction: a resident allocator/NEON slot IS the newest
+//     value (a dirty slot is exactly what we want to read), and pin / GPR-slot /
+//     NEON residency are mutually exclusive (invariants I1/I2), so the
+//     pin>slot>fallback order never returns a stale home. (The GE-M2 write
+//     helpers below mark their dest slots MODE_READ after depositing, which is
+//     what keeps a within-block writer→reader chain coherent here.)
 //   - consume the returned register in the immediately following
 //     instruction(s), before anything can mutate pins or allocator slots.
 //   - the returned register may be `scratch` or may not be — never write it.
@@ -975,15 +1063,27 @@ vixl::aarch64::Register _eeGetGPRSourceReg(const a64::Register& scratch, int fro
 {
 	if (fromgpr != 0 && !GPR_IS_CONST1(fromgpr))
 	{
-		if (const a64::Register* pin = armEEPinForGPR(fromgpr))
-			return scratch.Is64Bits() ? *pin : pin->W();
-
-		for (int i = 0; i < NUM_ARM_GPR_REGS; i++)
+		// A live 128-bit NEON home (an in-flight MMI / LQ result) is authoritative
+		// over BOTH the pin mirror and any GPR slot: an MMI write updates only the
+		// quad, and the pin + cpuRegs memory stay stale until a seam runs
+		// armStoreEEGPRQuad to refresh them. Take the no-emit pin/slot fast path
+		// only when no quad is live; otherwise fall through to _eeMoveGPRtoR, which
+		// reads lane 0 straight out of the quad. This is the coherence the RC0
+		// residency flip depends on — pre-flip the templates flushed the source
+		// (refreshing the pin) so the fast path was always current; post-flip a
+		// producer's quad can still be live when a consumer reads the reg here.
+		if (!_hasNEONreg(NEONTYPE_GPRREG, fromgpr))
 		{
-			if (arm64gprs[i].inuse && arm64gprs[i].type == ARM64TYPE_GPR &&
-				arm64gprs[i].reg == fromgpr && (arm64gprs[i].mode & MODE_READ))
+			if (const a64::Register* pin = armEEPinForGPR(fromgpr))
+				return scratch.Is64Bits() ? *pin : pin->W();
+
+			for (int i = 0; i < NUM_ARM_GPR_REGS; i++)
 			{
-				return scratch.Is64Bits() ? armXRegister(i) : armWRegister(i);
+				if (arm64gprs[i].inuse && arm64gprs[i].type == ARM64TYPE_GPR &&
+					arm64gprs[i].reg == fromgpr && (arm64gprs[i].mode & MODE_READ))
+				{
+					return scratch.Is64Bits() ? armXRegister(i) : armWRegister(i);
+				}
 			}
 		}
 	}
@@ -991,6 +1091,92 @@ vixl::aarch64::Register _eeGetGPRSourceReg(const a64::Register& scratch, int fro
 	_eeMoveGPRtoR(scratch, fromgpr);
 	return scratch;
 }
+
+// WRITE-side operand substitution (GE-M2 central write API). Resolve a guest
+// GPR's 64-bit write home so that a hand-written op deposits its result into a
+// pinned mirror or an allocator-resident host register when one exists, instead
+// of always storing to cpuRegs memory — the dest counterpart of
+// _eeGetGPRSourceReg. Mirrors PCSX2's x86 allocator-template dest handling
+// (pcsx2/x86/ix86-32/iR5900Templates.cpp + _allocX86reg, pcsx2/x86/iCore.cpp).
+//
+// Returns the X-sized write home (like armEEDestForGPR — the caller writes .W()
+// and sign-/zero-extends into it as the op requires). Before resolving, a scalar
+// write invalidates any live 128-bit dual-residence copy (writeback first so the
+// slot's UD[1] upper half survives in memory — the _deleteEEreg UD[1] rationale)
+// and clears the compile-time-const flag.
+//
+// alloc_if_used == false (the default, used by the Phase-1 coherence sweep) never
+// creates a new slot: it resolves to a pin, an already-resident slot, or the
+// caller's scratch — bit-for-bit today's pin/memory behavior when nothing is
+// resident. alloc_if_used == true lets the op claim a fresh MODE_WRITE slot for a
+// still-live dest (the residency flip, Phases 3/4).
+//
+// Emit-ordering contract (identical to armEEDestForGPR): ONLY the final
+// result-producing instruction may target the returned register, reading its
+// guest sources in that same instruction; follow it with _eeStoreGPRDestReg
+// before anything can observe the reg.
+vixl::aarch64::Register _eeGetGPRDestReg(int gpr, const a64::Register& scratch, bool alloc_if_used)
+{
+	// Scalar write kills any 128-bit copy (writeback preserves UD[1]) and any
+	// known-constant value for this reg.
+	_deleteGPRtoNEONreg(gpr, DELETE_REG_FREE);
+	GPR_DEL_CONST(gpr);
+
+	if (const a64::Register* pin = armEEPinForGPR(gpr))
+		return *pin;
+
+	int r = _checkArm64GPR(ARM64TYPE_GPR, gpr, MODE_WRITE);
+	if (r < 0 && alloc_if_used && EEINST_USEDTEST(gpr))
+		r = _allocArm64GPR(ARM64TYPE_GPR, gpr, MODE_WRITE);
+	if (r >= 0)
+		return armXRegister(r);
+
+	return scratch.X();
+}
+
+// Deposit `src` (the dest home itself, a source register, or xzr) into gpr's
+// resolved home. An allocator-resident dest takes a DEFERRED store: mark the
+// slot MODE_READ so _eeGetGPRSourceReg / branch / COP2 consumers pick the value
+// up before the next seam writes it back, and Mov only when src isn't already
+// the slot's host reg. A pinned or memory-backed dest takes the existing
+// lazy-dirty / canonical helper (a src that IS the pin emits nothing).
+void _eeStoreGPRDestReg(int gpr, const a64::Register& src)
+{
+	const int r = _checkArm64GPR(ARM64TYPE_GPR, gpr, MODE_READ | MODE_WRITE);
+	if (r >= 0)
+	{
+		if (src.GetCode() != static_cast<unsigned>(r))
+			armAsm->Mov(armXRegister(r), src.X());
+		return;
+	}
+	armStoreEERegPtr(src, &cpuRegs.GPR.r[gpr].UD[0]);
+}
+
+#ifdef PCSX2_DEVBUILD
+// GE-M2 coherence tripwire body (see armAssertRawGPRPtrCoherent's header
+// declaration for the full rationale). Reject a raw guest-GPR memory access
+// only when the reg's allocator/NEON copy is DIRTY (memory stale) and the reg
+// is neither $zero nor pinned.
+void armAssertRawGPRPtrCoherent(const void* field)
+{
+	const uptr base = reinterpret_cast<uptr>(&cpuRegs.GPR.r[0]);
+	const uptr f = reinterpret_cast<uptr>(field);
+	if (f < base || f >= base + sizeof(cpuRegs.GPR.r))
+		return; // not a guest-GPR pointer
+
+	const uptr rel = f - base;
+	if ((rel % sizeof(cpuRegs.GPR.r[0])) >= 8)
+		return; // upper 64 bits are never scalar-resident
+
+	const int n = static_cast<int>(rel / sizeof(cpuRegs.GPR.r[0]));
+	if (n == 0 || armEEPinForGPR(n) != nullptr)
+		return; // $zero and pinned regs: the raw path is authoritative
+
+	pxAssertMsg(!_hasArm64GPR(ARM64TYPE_GPR, n, MODE_WRITE) &&
+					!_hasNEONreg(NEONTYPE_GPRREG, n, MODE_WRITE),
+		"GE-M2 I3: raw guest-GPR memory access while its allocator/NEON copy is dirty");
+}
+#endif
 
 // =====================================================================================================
 //  Branch handling
@@ -1076,6 +1262,7 @@ static void emitCycleUpdateAndEventCheck()
 
 void SetBranchReg(EEBranchRegMode mode, u32 call_return_pc)
 {
+	const Cop2VfCacheScope vfCacheScope; // fork tail: preserve compile-time cache state
 	g_branch = 1;
 
 	// Flush all GPR/NEON/constant allocations FIRST, while host registers
@@ -1180,8 +1367,146 @@ void SetBranchReg(EEBranchRegMode mode, u32 call_return_pc)
 	armEmitCall((void*)recError);
 }
 
+// =====================================================================================================
+//  SL-1: loop-carried residency for self-loop blocks
+// =====================================================================================================
+// A block whose terminal branch targets its own startpc (the scanner's
+// backward-split rule guarantees loop heads are block starts) compiles with a
+// register-resident back-edge: the loop-live guest GPRs are allocated once in
+// a preheader (dirty-pessimized, loop-pinned), the loop-top label is bound
+// after it, and the taken arm of the terminal branch — instead of the normal
+// flush + event check + linked-B tail — emits a reconcile back to the loop-top
+// allocator state, the cycle/event check (side-exiting to a cold spill stub),
+// and a direct B to the loop-top. Dirty values ride host registers across
+// iterations; memory becomes current only on the exit arm, the event side
+// exit, or across any mid-body C seam (iFlushCall frees caller-saved entries
+// coherently, so seams stay correct — they just localize the win away).
+//
+// The runtime contract at the back-edge → loop-top jump: every snapshot (S0)
+// mapping holds its guest value in its host reg; every other allocatable host
+// reg is dead; memory is current for every guest reg NOT mapped by S0. The S0
+// dirty bits are pessimized (preheader allocates MODE_READ|MODE_WRITE) so the
+// body-emitted evictions always write back — a clean S0 bit over a runtime-
+// dirty value would lose writes.
+//
+// External observers never see mid-loop stale memory: reaching any frame
+// boundary, savestate, or C code requires leaving through the exit arm (full
+// flush), the spill stub (spills S0), or a mid-body seam (iFlushCall).
+
+static bool s_loopResident = false;
+static bool s_loopBackedgeEmitted = false;
+static u32 s_loopTopPc = 0;
+static _arm64gprregs s_loopEntryState[NUM_ARM_GPR_REGS];
+static std::unique_ptr<a64::Label> s_loopTopLabel;
+
+#ifdef PCSX2_RECOMPILER_TESTS
+static std::unordered_set<u32> s_loopResidentBlocks;
+bool recEeBlockIsLoopResident(u32 pc_query)
+{
+	return s_loopResidentBlocks.find(HWADDR(pc_query)) != s_loopResidentBlocks.end();
+}
+#endif
+
+// Emit the state transform "compile-state S1 → loop-top state S0" at the
+// back-edge. Phase A makes memory current for everything S0 doesn't carry: VF
+// compile cache, body-created constants (materialized BEFORE phase B so its
+// reloads see them), and every allocator entry that is not exactly an S0 pin
+// sitting in its S0 slot (misplaced pin guests route through memory — no
+// move-cycle handling needed). Phase B reloads S0 pins the body displaced.
+static void _eeLoopReconcileBackedge()
+{
+	cop2VfCacheFlush();
+	_flushConstRegs(false);
+
+	for (int i = 0; i < NUM_ARM_GPR_REGS; i++)
+	{
+		if (!arm64gprs[i].inuse)
+			continue;
+		const _arm64gprregs& want = s_loopEntryState[i];
+		if (want.inuse && arm64gprs[i].type == want.type && arm64gprs[i].reg == want.reg)
+			continue; // S0 pin riding through — stays resident and dirty
+		_freeArm64GPR(i); // writeback-if-dirty + free
+	}
+
+	// S0 carries no NEON entries: write back dirty quads so memory is current.
+	// The emitted loop-top code loads on demand; a residual clean value being
+	// clobbered by a later alloc is harmless.
+	_flushNEONregs();
+
+	for (int i = 0; i < NUM_ARM_GPR_REGS; i++)
+	{
+		const _arm64gprregs& want = s_loopEntryState[i];
+		if (!want.inuse)
+			continue;
+		if (arm64gprs[i].inuse && arm64gprs[i].type == want.type && arm64gprs[i].reg == want.reg)
+			continue;
+		pxAssert(!arm64gprs[i].inuse); // phase A vacated every mismatch
+		armLoadEERegPtrRaw(armXRegister(i), &cpuRegs.GPR.r[want.reg].UD[0]);
+	}
+}
+
+// Back-edge tail — replaces SetBranchImm on the resident self-loop taken arm.
+static void SetBranchBackedge()
+{
+	const Cop2VfCacheScope vfCacheScope; // fork tail: preserve compile-time cache state
+	g_branch = 1;
+
+	_eeLoopReconcileBackedge();
+
+	// Cycle update + event check, side-exiting to a local cold stub instead of
+	// DispatcherEvent (the stub owes the spill + pc store first).
+	a64::Label spill;
+	const u32 cycles = scaleblockcycles_clear();
+	if (cycles != 0)
+		armAsm->Adds(RECCYCLE, RECCYCLE, cycles);
+	else
+		armAsm->Cmp(RECCYCLE, 0);
+	armAsm->B(&spill, a64::ge);
+
+	// The resident back-edge. Registered on the block so recClear can repoint
+	// it to the spill stub (see Arm64BaseBlocks::Remove) — the entry redirect
+	// alone can't catch an internal branch, and a cleared self-loop must not
+	// keep executing stale code until the next event.
+	u8* backedge_site;
+	{
+		a64::SingleEmissionCheckScope guard(armAsm);
+		backedge_site = armGetCurrentCodePointer();
+		armAsm->b(s_loopTopLabel.get());
+	}
+
+	// Cold spill stub: runtime state here is exactly S0 (the reconcile ran on
+	// the fall-through into the event check). Write back the pinned set (S0
+	// pessimizes every pin dirty), publish the loop-top pc, and hand off to
+	// DispatcherEvent. Re-entry after the event comes through the block head,
+	// whose preheader reloads the pins.
+	armAsm->Bind(&spill);
+	s_pCurBlockEx->backedge_site = reinterpret_cast<uptr>(backedge_site);
+	s_pCurBlockEx->backedge_stub = reinterpret_cast<uptr>(armGetCurrentCodePointer());
+	for (int i = 0; i < NUM_ARM_GPR_REGS; i++)
+	{
+		const _arm64gprregs& want = s_loopEntryState[i];
+		if (want.inuse && (want.mode & MODE_WRITE))
+			armStoreEERegPtrRaw(armXRegister(i), &cpuRegs.GPR.r[want.reg].UD[0]);
+	}
+	armAsm->Mov(RWSCRATCH, s_loopTopPc);
+	armAsm->Str(RWSCRATCH, armCpuRegMem(&cpuRegs.pc));
+	armEmitJmp(DispatcherEvent);
+
+	s_loopBackedgeEmitted = true;
+#ifdef PCSX2_RECOMPILER_TESTS
+	s_loopResidentBlocks.insert(HWADDR(s_loopTopPc));
+#endif
+}
+
 void SetBranchImm(u32 imm)
 {
+	if (s_loopResident && !s_loopBackedgeEmitted && imm == s_loopTopPc)
+	{
+		SetBranchBackedge();
+		return;
+	}
+
+	const Cop2VfCacheScope vfCacheScope; // fork tail: preserve compile-time cache state
 	g_branch = 1;
 	pxAssert(imm);
 
@@ -1235,6 +1560,7 @@ void SetBranchImmCall(u32 imm, u32 return_pc)
 		return;
 	}
 
+	const Cop2VfCacheScope vfCacheScope; // fork tail: preserve compile-time cache state
 	g_branch = 1;
 	pxAssert(imm);
 
@@ -1278,33 +1604,229 @@ void SetBranchImmCall(u32 imm, u32 return_pc)
 //  Block state save/restore for delay slots
 // =====================================================================================================
 
-static _arm64gprregs s_savedGPRs[NUM_ARM_GPR_REGS];
-static _arm64neonregs s_savedNEON[NUM_ARM_NEON_REGS];
-static GPR_reg64 s_savedConstRegs[32];
-static u32 s_savedHasConstReg, s_savedFlushedConstReg;
-static u32 s_savedBlockCycles;
-static EEINST* s_savedInstInfo;
+// The full per-fork compile state: everything a branch arm needs restored to
+// re-emit from the fork point. Shared by the delay-slot fork
+// (SaveBranchState/LoadBranchState) and the superblock side-exit snapshots.
+struct BranchCompileState
+{
+	_arm64gprregs gprs[NUM_ARM_GPR_REGS];
+	_arm64neonregs neon[NUM_ARM_NEON_REGS];
+	GPR_reg64 constRegs[32];
+	u32 hasConstReg, flushedConstReg;
+	u32 blockCycles;
+	EEINST* instInfo;
+	Cop2VfCacheState vfCache;
+	bool clampConstsValid; // SL-13: q25/q26 broadcast validity at the fork point
+
+	void capture()
+	{
+		vfCache = cop2VfCacheGetState();
+		clampConstsValid = cop2ClampConstsValid();
+		blockCycles = s_nBlockCycles;
+		memcpy(constRegs, g_cpuConstRegs, sizeof(g_cpuConstRegs));
+		hasConstReg = g_cpuHasConstReg;
+		flushedConstReg = g_cpuFlushedConstReg;
+		instInfo = g_pCurInstInfo;
+		memcpy(gprs, arm64gprs, sizeof(arm64gprs));
+		memcpy(neon, arm64neon, sizeof(arm64neon));
+	}
+
+	void restore() const
+	{
+		cop2VfCacheSetState(vfCache);
+		cop2ClampConstsSetValid(clampConstsValid);
+		s_nBlockCycles = blockCycles;
+		memcpy(g_cpuConstRegs, constRegs, sizeof(g_cpuConstRegs));
+		g_cpuHasConstReg = hasConstReg;
+		g_cpuFlushedConstReg = flushedConstReg;
+		g_pCurInstInfo = instInfo;
+		memcpy(arm64gprs, gprs, sizeof(arm64gprs));
+		memcpy(arm64neon, neon, sizeof(arm64neon));
+	}
+};
+
+static BranchCompileState s_savedBranchState;
 
 void SaveBranchState()
 {
-	s_savedBlockCycles = s_nBlockCycles;
-	memcpy(s_savedConstRegs, g_cpuConstRegs, sizeof(g_cpuConstRegs));
-	s_savedHasConstReg = g_cpuHasConstReg;
-	s_savedFlushedConstReg = g_cpuFlushedConstReg;
-	s_savedInstInfo = g_pCurInstInfo;
-	memcpy(s_savedGPRs, arm64gprs, sizeof(arm64gprs));
-	memcpy(s_savedNEON, arm64neon, sizeof(arm64neon));
+	s_savedBranchState.capture();
 }
 
 void LoadBranchState()
 {
-	s_nBlockCycles = s_savedBlockCycles;
-	memcpy(g_cpuConstRegs, s_savedConstRegs, sizeof(g_cpuConstRegs));
-	g_cpuHasConstReg = s_savedHasConstReg;
-	g_cpuFlushedConstReg = s_savedFlushedConstReg;
-	g_pCurInstInfo = s_savedInstInfo;
-	memcpy(arm64gprs, s_savedGPRs, sizeof(arm64gprs));
-	memcpy(arm64neon, s_savedNEON, sizeof(arm64neon));
+	s_savedBranchState.restore();
+}
+
+// =====================================================================================================
+//  SL-03: superblocks — conditional-fallthrough continuation
+// =====================================================================================================
+// The scanner records forward conditional branches (BEQ/BNE/BLEZ/BGTZ/BLTZ/
+// BGEZ; non-likely, non-link) as continuation sites and keeps scanning at the
+// fallthrough, so the not-taken path compiles as one straight line: no pc
+// store, no event check, no linked-B, no next-head reload — register/const
+// residency rides through the former boundary. The taken arm becomes a cold
+// side exit outlined after the block tail; it snapshots the compile state at
+// the branch, and its emission restores that snapshot, compiles the taken-path
+// delay slot (unless TrySwapDelaySlot already hoisted it), and ends with the
+// normal SetBranchImm tail. Analysis stays exactly as conservative as today's
+// block ends: the liveness backward pass merges all-live at each site (the
+// taken path leaves the block there), and the COP2 deferred-commit passes run
+// per segment delimited at sites. Event-check coarsening equals today's
+// straight-line blocks (one check per exit, range capped by the 4K page).
+
+static constexpr int kMaxContSites = 8;
+static constexpr u32 kMaxSuperblockInsns = 128;
+
+static u32 s_contSitePcs[kMaxContSites]; // ascending (scan order)
+static int s_numContSites = 0;
+
+struct SuperblockSideExit
+{
+	std::unique_ptr<a64::Label> label;
+	u32 branchTo;
+	u32 dsPc;
+	bool needDs;
+	BranchCompileState state;
+};
+static SuperblockSideExit s_sideExits[kMaxContSites];
+static int s_numSideExits = 0;
+
+bool recSuperblockIsContSite(u32 branch_pc)
+{
+	for (int i = 0; i < s_numContSites; i++)
+		if (s_contSitePcs[i] == branch_pc)
+			return true;
+	return false;
+}
+
+// Snapshot the compile state for the taken path and hand back the label the
+// handler's inverted condition branches to. Call after _eeFlushAllDirty and
+// (for a swapped slot) after the delay-slot emission; the compare itself is a
+// pure post-flush read and may be emitted after the snapshot. pc points at the
+// delay slot here.
+a64::Label* recSuperblockAddSideExit(u32 branch_target, bool need_delay_slot)
+{
+	pxAssert(s_numSideExits < kMaxContSites);
+	SuperblockSideExit& x = s_sideExits[s_numSideExits++];
+	x.label = std::make_unique<a64::Label>();
+	x.branchTo = branch_target;
+	x.dsPc = pc;
+	x.needDs = need_delay_slot;
+	x.state.capture();
+	return x.label.get();
+}
+
+// SL-10: the in-block footprint of a side exit is one island — a single far B
+// (imm26, ±128MB reaches the cold arena) that the site's short-range
+// conditional (Tbz ±32KB / B.cond ±1MB) can target. Bound after the tail,
+// patched toward the outlined exit body once the cold session has emitted it.
+static u8* s_sideExitIslands[kMaxContSites];
+
+// Emit the per-exit islands after the block tail (still inside the hot
+// emission session — they are part of the block and count in x86size).
+// The mainline pc/size/recRAMCopy bookkeeping ran before this — pc is dead.
+static void recEmitSideExitIslands()
+{
+	for (int k = 0; k < s_numSideExits; k++)
+	{
+		SuperblockSideExit& x = s_sideExits[k];
+		armAsm->Bind(x.label.get());
+		a64::SingleEmissionCheckScope guard(armAsm);
+		s_sideExitIslands[k] = armGetCurrentCodePointer();
+		armAsm->b(int64_t{0}); // placeholder; patched to the cold exit body
+	}
+}
+
+// SL-11: compact cold-exit tail — SetBranchImm's shape with the Str-pc /
+// cycle-update / event-check factored into the shared SuperblockExitStub.
+// Falls back to SetBranchImm for its special-case shapes (resident back-edge,
+// WaitLoop FF), which never apply to a continuation side exit in practice.
+static void recEmitSideExitTail(u32 imm)
+{
+	if ((s_loopResident && !s_loopBackedgeEmitted && imm == s_loopTopPc) ||
+		(EmuConfig.Speedhacks.WaitLoop && s_nBlockFF && imm == s_branchTo))
+	{
+		SetBranchImm(imm);
+		return;
+	}
+
+	const Cop2VfCacheScope vfCacheScope; // fork tail: preserve compile-time cache state
+	g_branch = 1;
+	pxAssert(imm);
+
+	iFlushCall(FLUSH_EVERYTHING);
+
+	armAsm->Mov(RWSCRATCH, imm);
+	armAsm->Mov(RWARG2, scaleblockcycles_clear());
+	armEmitCall(SuperblockExitStub);
+
+	// RET lands here: the linked B (same patch protocol as SetBranchImm).
+	a64::SingleEmissionCheckScope guard(armAsm);
+	u8* patch_site = armGetCurrentCodePointer();
+	armAsm->b(int64_t{0}); // placeholder; recBlocks.Link will overwrite
+	recBlocks.Link(HWADDR(imm), patch_site);
+}
+
+// Island → cold-body patch: same single-word B rewrite + cache maintenance
+// protocol as Arm64BaseBlocks link patching (compile-thread only here).
+static void recPatchIslandB(u8* site, const u8* target)
+{
+	const intptr_t imm26 = (reinterpret_cast<intptr_t>(target) - reinterpret_cast<intptr_t>(site)) >> 2;
+	pxAssertRel(imm26 >= -(1 << 25) && imm26 < (1 << 25), "Cold-exit island out of B imm26 range");
+	*reinterpret_cast<volatile u32*>(site) = 0x14000000u | (static_cast<u32>(imm26) & 0x03FFFFFFu);
+	__builtin___clear_cache(reinterpret_cast<char*>(site), reinterpret_cast<char*>(site) + 4);
+}
+
+// Emit every pending side exit body into the cold arena (a second emission
+// session, after the hot block finalized) and patch the islands to reach
+// them. Each body restores its branch-point snapshot, so the exit charges
+// exactly the branch-point cycles and the flush writes back exactly what was
+// live-dirty there.
+static void recEmitColdSideExits()
+{
+	const int n = s_numSideExits;
+	s_numSideExits = 0;
+	if (n == 0)
+		return;
+
+	const u8* coldStart[kMaxContSites];
+
+	armSetAsmPtr(s_coldPtr, s_coldPtrEnd - s_coldPtr + _64kb, &s_eeConstantPool);
+	armStartBlock();
+	for (int k = 0; k < n; k++)
+	{
+		SuperblockSideExit& x = s_sideExits[k];
+		coldStart[k] = armGetCurrentCodePointer();
+		x.state.restore();
+		g_branch = 0;
+		if (x.needDs)
+		{
+			pc = x.dsPc;
+			recompileNextInstruction(true, false);
+		}
+		recEmitSideExitTail(x.branchTo);
+		x.label.reset();
+	}
+	pxAssert(armGetCurrentCodePointer() < SysMemory::GetEERecEnd());
+	s_coldPtr = armEndBlock();
+
+	HostSys::BeginCodeWrite();
+	for (int k = 0; k < n; k++)
+		recPatchIslandB(s_sideExitIslands[k], coldStart[k]);
+	HostSys::EndCodeWrite();
+
+	g_branch = 1;
+}
+
+// Liveness barrier for the backward pass: `addr` is a continuation branch or
+// its delay slot. The taken path leaves the block after the delay slot, so no
+// dead-value assumption may cross either out-state.
+static bool recSuperblockLivenessBarrier(u32 addr)
+{
+	for (int i = 0; i < s_numContSites; i++)
+		if (addr == s_contSitePcs[i] || addr == s_contSitePcs[i] + 4)
+			return true;
+	return false;
 }
 
 // =====================================================================================================
@@ -1372,6 +1894,14 @@ void recompileNextInstruction(bool delayslot, bool swapped_delay_slot)
 	EEINST* old_inst_info = g_pCurInstInfo;
 
 	cpuRegs.code = memRead32(pc);
+
+	// EP-2b: default-flush seam — any op that is not a cache-aware
+	// hand-rolled COP2 macro op kills the VF residency cache (dirty
+	// writebacks emit here, before the op's own code). Whitelist over
+	// blocklist: an emitter this policy doesn't know about can never
+	// corrupt or be corrupted by the cache.
+	if (!cop2OpPreservesVfCache(cpuRegs.code))
+		cop2VfCacheFlush();
 
 	if (!delayslot)
 	{
@@ -1858,6 +2388,17 @@ static void recClear(u32 addr, u32 size)
 	addr = HWADDR(addr);
 	const u32 end = addr + size * 4;
 
+#ifdef PCSX2_RECOMPILER_TESTS
+	// Keep the loop-residency introspection in sync with the live block set.
+	for (auto it = s_loopResidentBlocks.begin(); it != s_loopResidentBlocks.end();)
+	{
+		if (*it >= addr && *it < end)
+			it = s_loopResidentBlocks.erase(it);
+		else
+			++it;
+	}
+#endif
+
 	int blockidx = recBlocks.LastIndex(end - 4);
 	if (blockidx == -1)
 		return;
@@ -1958,8 +2499,10 @@ static void dyna_page_reset(u32 start, u32 sz)
 
 // Self-modifying code detection — generates inline memory comparison checks
 // for blocks in manually-protected pages, and sets up page protection for new pages.
-// Port of x86 memory_protect_recompiled_code().
-static void memory_protect_recompiled_code(u32 startpc, u32 size)
+// Port of x86 memory_protect_recompiled_code(). Returns true when the block
+// got an inline manual SMC check — such blocks are excluded from SL-1 loop
+// residency (the entry check must run every iteration).
+static bool memory_protect_recompiled_code(u32 startpc, u32 size)
 {
 	u32 inpage_ptr = HWADDR(startpc);
 	const u32 inpage_sz = size * 4;
@@ -2079,6 +2622,8 @@ static void memory_protect_recompiled_code(u32 startpc, u32 size)
 			break;
 		}
 	}
+
+	return PageType == ProtMode_Manual;
 }
 
 // =====================================================================================================
@@ -2111,16 +2656,6 @@ static void recReserveRAM()
 static void recReserve()
 {
 	Console.WriteLn(Color_Green, "EE: ARM64 Recompiler reserved.");
-	recPtr = SysMemory::GetEERec();
-	recPtrEnd = SysMemory::GetEERecEnd() - _64kb;
-
-	recReserveRAM();
-
-	pxAssertRel(!s_pInstCache, "InstCache not allocated");
-	s_nInstCacheSize = 128;
-	s_pInstCache = (EEINST*)malloc(sizeof(EEINST) * s_nInstCacheSize);
-	if (!s_pInstCache)
-		pxFailRel("Failed to allocate R5900 InstCache array.");
 
 	// 256KB: the FX-03a manual-check snapshots are blobs, not dedup'd
 	// literals — a manual-heavy title banks ~70-80KB of them per rec
@@ -2129,6 +2664,39 @@ static void recReserve()
 	const u32 poolSize = 262144;
 	u8* poolBase = SysMemory::GetEERecEnd() - poolSize;
 	s_eeConstantPool.Init(poolBase, poolSize);
+
+	// Code region: everything below the pool, minus the 64KB slop a single
+	// compile may overhang past recPtrEnd (armSetAsmPtr grants capacity
+	// recPtrEnd - recPtr + 64KB; the cache-full reset triggers on the NEXT
+	// compile). recPtrEnd must sit BELOW poolBase by the slop, or a block
+	// compiled near the full mark overwrites the pool — whose first bytes
+	// are the dispatcher stubs' far-call veneers (bl → mov x16/../br), so
+	// the corruption fires on the next event dispatch, far from the cause.
+	// (Latent since the pool moved to the cache tail; surfaced by SL-03
+	// superblocks growing per-block emission enough for the fuzz soak to
+	// fill the cache into the overlap.)
+	// SL-10: cold side-exit arena between the hot code region and the pool.
+	// Same slop discipline as the hot region: a session's capacity grant is
+	// (end - ptr + 64KB), so each region's ptr-end sits one slop below the
+	// next region's base and an overhanging emission can never cross it.
+	const u32 coldArenaSize = 8 * _1mb;
+	s_coldBase = poolBase - coldArenaSize;
+	s_coldPtr = s_coldBase;
+	s_coldPtrEnd = poolBase - _64kb;
+
+	recPtr = SysMemory::GetEERec();
+	recPtrEnd = s_coldBase - _64kb;
+	pxAssertRel(recPtrEnd > recPtr && recPtrEnd + _64kb <= s_coldBase &&
+		s_coldPtrEnd + _64kb <= poolBase,
+		"EE rec code region and cold arena must not reach the constant pool");
+
+	recReserveRAM();
+
+	pxAssertRel(!s_pInstCache, "InstCache not allocated");
+	s_nInstCacheSize = 128;
+	s_pInstCache = (EEINST*)malloc(sizeof(EEINST) * s_nInstCacheSize);
+	if (!s_pInstCache)
+		pxFailRel("Failed to allocate R5900 InstCache array.");
 }
 
 static void recResetRaw()
@@ -2140,6 +2708,14 @@ static void recResetRaw()
 	// needs nothing: dead block entries keep resolving via redirect stubs.)
 	eeCallRetResetRing();
 
+#ifdef PCSX2_RECOMPILER_TESTS
+	s_loopResidentBlocks.clear();
+#endif
+
+	// COP2 macro-mode emitters read their clamp/mask constants from the pack
+	// ([RSTATE, #imm]) — (re)write them before any block compiles.
+	cop2RecWritePackConstants();
+
 	// Full reset regenerates every block and dispatcher, so nothing can
 	// reference old pool content — drop it. Required since FX-03a: the
 	// manual-check snapshot blobs are not dedup'd, so without this the pool
@@ -2150,8 +2726,24 @@ static void recResetRaw()
 	armStartBlock();
 	const u8* dispStart = armGetCurrentCodePointer();
 	_DynGen_Dispatchers();
+
+	// SL-11: the shared cold-exit tail. Contract on entry: guest state fully
+	// flushed, RWSCRATCH = target guest pc, RWARG2 (w1) = scaled block cycles
+	// (zero-extended). Adds with a zero register still sets N/Z from RECCYCLE,
+	// matching emitCycleUpdateAndEventCheck's Cmp-on-zero-cycles shape. The
+	// no-event path RETs to the BL site's linked B; the event path discards
+	// the link register (pc is already stored, DispatcherEvent re-enters
+	// through the dispatcher).
+	SuperblockExitStub = armGetCurrentCodePointer();
+	armAsm->Str(RWSCRATCH, armCpuRegMem(&cpuRegs.pc));
+	armAsm->Adds(RECCYCLE, RECCYCLE, a64::x1);
+	armEmitCondBranch(a64::ge, DispatcherEvent);
+	armAsm->Ret();
+
 	const u8* dispEnd = armGetCurrentCodePointer();
 	recPtr = armEndBlock();
+
+	s_coldPtr = s_coldBase;
 
 	Console.WriteLn(Color_Green, "EE ARM64: Dispatcher generated at %p (%zu bytes)", dispStart, (size_t)(dispEnd - dispStart));
 
@@ -2236,6 +2828,9 @@ static void recShutdown()
 
 	recPtr = nullptr;
 	recPtrEnd = nullptr;
+	s_coldBase = nullptr;
+	s_coldPtr = nullptr;
+	s_coldPtrEnd = nullptr;
 }
 
 static void recResetEE()
@@ -2340,6 +2935,27 @@ s32 recEeExecuteBlock(s32 cycles, u32 park_pc)
 bool recEeIsBlockLinked(u32 src_pc, u32 dst_pc)
 {
 	return recBlocks.IsLinked(src_pc, dst_pc);
+}
+
+// SL-1 introspection: the registered back-edge patch site + spill stub of the
+// block at pc_query, so tests can assert Remove()'s repoint after a recClear.
+bool recEeLoopBackedgeInfo(u32 pc_query, uptr* site, uptr* stub)
+{
+	BASEBLOCKEX* b = recBlocks.Get(HWADDR(pc_query));
+	if (!b || !b->backedge_site)
+		return false;
+	*site = b->backedge_site;
+	*stub = b->backedge_stub;
+	return true;
+}
+
+// SL-03 introspection: guest-insn size of the compiled block starting at
+// pc_query (0 = no block), so tests can assert superblock formation (the
+// range spans past a continuation branch) vs termination (it doesn't).
+u32 recEeBlockGuestSize(u32 pc_query)
+{
+	BASEBLOCKEX* b = recBlocks.Get(HWADDR(pc_query));
+	return b ? b->size : 0;
 }
 
 // Test-harness recLUT coverage introspection: does this guest PC dispatch to
@@ -2482,6 +3098,100 @@ static bool recSkipTimeoutLoop(s32 reg, bool is_timeout_loop)
 //  Main Recompilation Loop
 // =====================================================================================================
 
+// Scanner-side decode: is `code` any branch/jump/eret/syscall-class op (a
+// block-ender or continuation candidate)? Used to refuse continuation through
+// a branch whose delay slot is itself a branch (architecturally-UB shape) —
+// those fall back to ending the block, which is today's behavior.
+static bool eeScanInsnIsBranchClass(u32 code)
+{
+	switch (code >> 26)
+	{
+		case 0: // SPECIAL
+		{
+			const u32 funct = code & 0x3f;
+			return funct == 8 || funct == 9 || funct == 12 || funct == 13; // JR/JALR/SYSCALL/BREAK
+		}
+		case 1: // REGIMM
+		{
+			const u32 rt = (code >> 16) & 0x1f;
+			return rt < 4 || (rt >= 16 && rt < 20);
+		}
+		case 2: case 3: // J, JAL
+		case 4: case 5: case 6: case 7: // BEQ, BNE, BLEZ, BGTZ
+		case 20: case 21: case 22: case 23: // likely forms
+			return true;
+		case 16: // COP0: BC0x or ERET
+			return ((code >> 21) & 0x1f) == 8 ||
+				   (((code >> 21) & 0x1f) == 16 && (code & 0x3f) == 24);
+		case 17: case 18: // COP1/COP2: BCx
+			return ((code >> 21) & 0x1f) == 8;
+	}
+	return false;
+}
+
+// Scanner-side continuation gate for a conditional branch at `i` targeting
+// `target`. Forward-only (backward keeps the split/end logic), bounded, and
+// refuses a branch-class delay slot.
+static bool eeScanContinuable(u32 startpc, u32 i, u32 target, u32 famBit)
+{
+	// Testing-only kill switch (offline A/B bisection of superblock formation):
+	// YAPS2_EESB is a bitmask of continuation-site families — bit0 BEQ/BNE,
+	// bit1 BLEZ/BGTZ, bit2 REGIMM BLTZ/BGEZ. Unset = all on; 0 = all off
+	// (reverts block formation to the pre-superblock shape without a rebuild).
+	// Not a production knob.
+	static const u32 s_sitesMask = []() -> u32 {
+		const char* e = std::getenv("YAPS2_EESB");
+		return e ? static_cast<u32>(std::atoi(e)) : 0xffu;
+	}();
+	if (!(s_sitesMask & famBit))
+		return false;
+	// Optional guest-pc window (hex), same offline-bisection purpose: only
+	// branches inside [YAPS2_EESB_LO, YAPS2_EESB_HI) become sites.
+	static const u32 s_siteLo = []() -> u32 {
+		const char* e = std::getenv("YAPS2_EESB_LO");
+		return e ? static_cast<u32>(std::strtoul(e, nullptr, 16)) : 0u;
+	}();
+	static const u32 s_siteHi = []() -> u32 {
+		const char* e = std::getenv("YAPS2_EESB_HI");
+		return e ? static_cast<u32>(std::strtoul(e, nullptr, 16)) : 0xffffffffu;
+	}();
+	if (i < s_siteLo || i >= s_siteHi)
+		return false;
+	return target > i + 4 &&
+		   s_numContSites < kMaxContSites &&
+		   ((i + 8 - startpc) / 4) < kMaxSuperblockInsns &&
+		   !eeScanInsnIsBranchClass(memRead32(i + 4));
+}
+
+// A backward-split target that lands exactly on a continuation site's delay
+// slot would leave that branch as the last insn of the range with its delay
+// slot outside the analyzed block (instinfo overrun, split-pair emission).
+// End the block before the branch instead; the split's purpose — making the
+// target a block start — is preserved (a block starting at the delay-slot
+// address compiles it as a plain instruction, which is the architectural
+// meaning of branching into a delay slot).
+//
+// Degenerate case: the site is the block's FIRST instruction (guest loops
+// that re-enter at the head branch's delay slot — e.g. UYA's dcache flush
+// routine: `beqz exit; addiu t2,-1; ...; bgtz t2, <the addiu>`). Clamping
+// there would yield s_nEndBlock == startpc — a zero-length block whose
+// short tail is an unconditional self-linked B with no event check, i.e. a
+// hard wedge. Skipping the split is always correct (the target simply gets
+// its own block when branched to), so fall back to ending at the branch.
+static u32 eeSuperblockClampSplit(u32 startpc, u32 branch_i, u32 target)
+{
+	for (int k = 0; k < s_numContSites; k++)
+	{
+		if (target == s_contSitePcs[k] + 4)
+		{
+			if (s_contSitePcs[k] > startpc)
+				return s_contSitePcs[k];
+			return branch_i + 8; // degenerate: no split, end at the branch
+		}
+	}
+	return target;
+}
+
 static void recRecompile(const u32 startpc)
 {
 	u32 i;
@@ -2490,8 +3200,13 @@ static void recRecompile(const u32 startpc)
 	// but it can legitimately happen during BIOS init (e.g., JR $ra with ra=0).
 	// We allow it since address 0 is properly mapped in recLUT.
 
-	if (recPtr >= recPtrEnd)
+	if (recPtr >= recPtrEnd || s_coldPtr >= s_coldPtrEnd)
+	{
+		Console.WriteLn("EE ARM64: cache-full reset trigger — hot used=%zu/%zu cold used=%zu/%zu",
+			(size_t)(recPtr - SysMemory::GetEERec()), (size_t)(recPtrEnd - SysMemory::GetEERec()),
+			(size_t)(s_coldPtr - s_coldBase), (size_t)(s_coldPtrEnd - s_coldBase));
 		eeRecNeedsReset = true;
+	}
 
 	// Signal that the ELF entry point is now compiling, so VMManager flips
 	// HasBootedELF() and applies the per-game GameDB fixes (both game fixes and
@@ -2526,10 +3241,17 @@ static void recRecompile(const u32 startpc)
 		s_pCurBlockEx = recBlocks.New(HWADDR(startpc), block_fnptr);
 
 	g_branch = 0;
+	cop2VfCacheReset();
+	cop2ClampConstsInvalidate(); // SL-13: q25/q26 state unknown at block entry
 
 	s_pCurBlock->SetFnptr(block_fnptr);
 	s_nBlockCycles = 0;
 	s_nBlockInterlocked = false;
+
+	// A recompile at a startpc reuses the existing BASEBLOCKEX — drop any
+	// stale SL-1 back-edge registration from the previous compile.
+	s_pCurBlockEx->backedge_site = 0;
+	s_pCurBlockEx->backedge_stub = 0;
 
 	pc = startpc;
 	g_cpuHasConstReg = g_cpuFlushedConstReg = 1;
@@ -2661,6 +3383,8 @@ static void recRecompile(const u32 startpc)
 	i = startpc;
 	s_nEndBlock = 0xffffffff;
 	s_branchTo = -1;
+	s_branchLoopable = false;
+	s_numContSites = 0;
 
 	// Timeout loop detection (matches x86 recSkipTimeoutLoop pattern):
 	//   addiu reg,reg,-N / nop*N / bne reg,zero,loop / nop
@@ -2729,12 +3453,24 @@ static void recRecompile(const u32 startpc)
 			case 1: // REGIMM
 				if (_Rt_ < 4 || (_Rt_ >= 16 && _Rt_ < 20))
 				{
+					// rt 16-19 are the AL link variants — call-shaped tails
+					// (SetBranchImmCall), not back-edge candidates.
+					// SL-03: forward BLTZ/BGEZ (rt 0/1) become continuation
+					// sites — scan on at the fallthrough. Likely + AL forms
+					// keep ending the block.
+					if (_Rt_ < 2 && eeScanContinuable(startpc, i, _Imm_ * 4 + i + 4, 4u))
+					{
+						s_contSitePcs[s_numContSites++] = i;
+						i += 8; // skip the delay slot word in the scan
+						continue;
+					}
+					s_branchLoopable = _Rt_ < 4;
 					s_branchTo = _Imm_ * 4 + i + 4;
 					// Backward branch into the current block: end the block at the
 					// target so the loop head becomes its own linkable block.
 					// Mirrors x86 iR5900.cpp:2362 and the COP1/COP2 case below.
 					if (s_branchTo > startpc && s_branchTo < i)
-						s_nEndBlock = s_branchTo;
+						s_nEndBlock = eeSuperblockClampSplit(startpc, i, s_branchTo);
 					else
 					{
 						s_nEndBlock = i + 8;
@@ -2744,19 +3480,34 @@ static void recRecompile(const u32 startpc)
 				break;
 
 			case 2: case 3: // J, JAL
+				s_branchLoopable = (cpuRegs.code >> 26) == 2; // JAL = call tail
 				s_branchTo = (_InstrucTarget_ << 2) | ((i + 4) & 0xf0000000);
 				s_nEndBlock = i + 8;
 				goto StartRecomp;
 
 			case 4: case 5: case 6: case 7: // BEQ, BNE, BLEZ, BGTZ
+				// SL-03: forward conditionals become continuation sites — scan
+				// on at the fallthrough. BEQ rs==rt is the unconditional-`b`
+				// idiom (always taken: everything after is unreachable on the
+				// fallthrough) and keeps ending the block.
+				if (!((cpuRegs.code >> 26) == 4 && _Rs_ == _Rt_) &&
+					eeScanContinuable(startpc, i, _Imm_ * 4 + i + 4,
+						(cpuRegs.code >> 26) < 6 ? 1u : 2u))
+				{
+					s_contSitePcs[s_numContSites++] = i;
+					i += 8; // skip the delay slot word in the scan
+					continue;
+				}
+				[[fallthrough]];
 			case 20: case 21: // BEQL, BNEL
 			case 22: case 23: // BLEZL, BGTZL
+				s_branchLoopable = true;
 				s_branchTo = _Imm_ * 4 + i + 4;
 				// Backward branch into the current block: split so the loop head
 				// is its own linkable block. Mirrors x86 iR5900.cpp:2387 and
 				// the COP1/COP2 case below.
 				if (s_branchTo > startpc && s_branchTo < i)
-					s_nEndBlock = s_branchTo;
+					s_nEndBlock = eeSuperblockClampSplit(startpc, i, s_branchTo);
 				else
 				{
 					s_nEndBlock = i + 8;
@@ -2776,9 +3527,10 @@ static void recRecompile(const u32 startpc)
 			case 18: // COP2
 				if (_Rs_ == 8) // BC0/BC1/BC2 F/T/FL/TL
 				{
+					s_branchLoopable = true;
 					s_branchTo = _Imm_ * 4 + i + 4;
 					if (s_branchTo > startpc && s_branchTo < i)
-						s_nEndBlock = s_branchTo;
+						s_nEndBlock = eeSuperblockClampSplit(startpc, i, s_branchTo);
 					else
 					{
 						s_nEndBlock = i + 8;
@@ -2793,8 +3545,21 @@ static void recRecompile(const u32 startpc)
 
 StartRecomp:
 
+	// SL-03: a backward-split can truncate s_nEndBlock below already-recorded
+	// continuation sites — drop any site whose branch+delay-slot pair no longer
+	// fits inside [startpc, s_nEndBlock). (Sites are ascending; the compile
+	// loop never reaches a dropped one, but the analysis passes below must not
+	// treat it as an exit boundary either.)
+	while (s_numContSites > 0 && s_contSitePcs[s_numContSites - 1] + 8 > s_nEndBlock)
+		s_numContSites--;
+
+	// A zero-length block would compile to an unconditional self-linked B
+	// with no event check (hard wedge) — eeSuperblockClampSplit's degenerate
+	// fallback guarantees this can't happen.
+	pxAssert(s_nEndBlock > startpc);
+
 	// Self-modifying code detection: generate inline memory checks for manual blocks.
-	memory_protect_recompiled_code(startpc, (s_nEndBlock - startpc) >> 2);
+	const bool is_manual_block = memory_protect_recompiled_code(startpc, (s_nEndBlock - startpc) >> 2);
 
 	// Infinite (wait) loop detection — verbatim port of the x86 hazard
 	// tracker (ix86-32/iR5900.cpp:2438-2515), replacing the old all-NOP-only
@@ -2925,6 +3690,18 @@ StartRecomp:
 		for (i = s_nEndBlock; i > startpc; i -= 4)
 		{
 			cpuRegs.code = memRead32(i - 4);
+			// SL-03: at a continuation site the taken path leaves the block
+			// after the delay slot — merge "everything live" (the block-end
+			// init state) into the out-state of both the branch and its delay
+			// slot so no dead-value assumption crosses the side exit. This is
+			// exactly today's block-end conservatism at the former boundary.
+			if (recSuperblockLivenessBarrier(i - 4))
+			{
+				memset(pcur->regs, EEINST_LIVE, sizeof(pcur->regs));
+				memset(pcur->fpuregs, EEINST_LIVE, sizeof(pcur->fpuregs));
+				memset(pcur->vfregs, EEINST_LIVE, sizeof(pcur->vfregs));
+				memset(pcur->viregs, EEINST_LIVE, sizeof(pcur->viregs));
+			}
 			pcur[-1] = pcur[0];
 			recBackpropBSC(cpuRegs.code, pcur - 1, pcur);
 			pcur--;
@@ -2934,12 +3711,27 @@ StartRecomp:
 
 		// Run COP2 analysis passes — sets EEINST_COP2_SYNC_VU0/FINISH_VU0 flags
 		// for conditional VU0 synchronization in transfer ops.
+		// SL-03: run per segment, delimited at continuation sites. Both passes
+		// defer commits forward (flag-hack elision, micro-finish placement); a
+		// deferral must not cross a side exit that can escape before the
+		// superseding instruction executes. Per-segment == today's per-block
+		// semantics at each former boundary.
 		if (has_cop2_instructions)
 		{
-			R5900::COP2MicroFinishPass().Run(startpc, s_nEndBlock, s_pInstCache + 1);
+			u32 seg_start = startpc;
+			for (int k = 0; k <= s_numContSites; k++)
+			{
+				const u32 seg_end = (k < s_numContSites) ? (s_contSitePcs[k] + 8) : s_nEndBlock;
+				if (seg_end <= seg_start)
+					continue;
+				EEINST* const seg_inst = s_pInstCache + 1 + (seg_start - startpc) / 4;
+				R5900::COP2MicroFinishPass().Run(seg_start, seg_end, seg_inst);
 
-			if (EmuConfig.Speedhacks.vuFlagHack)
-				R5900::COP2FlagHackPass().Run(startpc, s_nEndBlock, s_pInstCache + 1);
+				if (EmuConfig.Speedhacks.vuFlagHack)
+					R5900::COP2FlagHackPass().Run(seg_start, seg_end, seg_inst);
+
+				seg_start = seg_end;
+			}
 		}
 	}
 
@@ -2959,8 +3751,72 @@ StartRecomp:
 		// Sweep any LDL/LDR fusion residue from an aborted prior compile (the
 		// per-pair gate otherwise guarantees same-block consume).
 		g_eeUnalignedFused = false;
+		// SL-03: sweep side-exit residue the same way (recEmitPendingSideExits
+		// drains the list on every completed compile).
+		s_numSideExits = 0;
+
+		// SL-1 candidacy: a resident self-loop is a block whose terminal branch
+		// targets its own startpc. Wait-loop-FF blocks keep the fast-forward
+		// tail; manual/SMC blocks are excluded (the entry check must run per
+		// iteration). Pin the most-used guest GPRs in a preheader and bind the
+		// loop-top label after it — see the SL-1 comment block above
+		// SetBranchBackedge for the full contract.
+		s_loopResident = false;
+		s_loopBackedgeEmitted = false;
+		if (s_branchLoopable && s_branchTo == startpc && !s_nBlockFF && !is_manual_block)
+		{
+			const int ninsts = static_cast<int>((s_nEndBlock - startpc) / 4);
+			int uses[32] = {};
+			for (int k = 1; k <= ninsts; k++)
+				for (int r = 1; r < 32; r++)
+					if (s_pInstCache[k].regs[r] & EEINST_USED)
+						uses[r]++;
+
+			struct LoopCand
+			{
+				int reg;
+				int uses;
+			};
+			LoopCand cands[32];
+			int ncand = 0;
+			for (int r = 1; r < 32; r++)
+			{
+				// Pin-table guest regs already live in dedicated mirrors and
+				// must never get a scalar allocator home (GE-M2 I1).
+				if (uses[r] > 0 && !armEEPinForGPR(r))
+					cands[ncand++] = {r, uses[r]};
+			}
+			std::sort(cands, cands + ncand,
+				[](const LoopCand& a, const LoopCand& b) { return a.uses > b.uses; });
+
+			// Leave ≥2 pool regs unpinned for temps/FPRC churn; eviction of a
+			// pin is legal anyway (reconcile restores), this just keeps the
+			// common body allocation off the pins.
+			// A zero-pin candidate (loop-live set entirely pin-table regs) still
+			// activates: S0 = empty allocator is valid, and the back-edge still
+			// drops the pc-store + link hop.
+			constexpr int kMaxLoopPins = 5;
+			const int npins = std::min(ncand, kMaxLoopPins);
+			for (int k = 0; k < npins; k++)
+			{
+				// MODE_WRITE up front pessimizes the dirty bit: the loop-top
+				// snapshot must claim dirty ⊇ any runtime dirty, or a body-
+				// emitted eviction could drop a previous iteration's write.
+				const int host = _allocArm64GPR(ARM64TYPE_GPR, cands[k].reg, MODE_READ | MODE_WRITE);
+				arm64gprs[host].looppin = 1;
+			}
+			_clearNeededArm64GPRregs();
+			std::memcpy(s_loopEntryState, arm64gprs, sizeof(arm64gprs));
+			s_loopTopPc = startpc;
+			s_loopTopLabel = std::make_unique<a64::Label>();
+			armAsm->Bind(s_loopTopLabel.get());
+			s_loopResident = true;
+		}
+
 		while (!g_branch && pc < s_nEndBlock)
 			recompileNextInstruction(false, false);
+
+		s_loopResident = false;
 	}
 
 	pxAssert((pc - startpc) >> 2 <= 0xffff);
@@ -3063,6 +3919,12 @@ StartRecomp:
 		}
 	}
 
+	// SL-03/SL-10: the taken side exits' in-block footprint — one far-B island
+	// each after the tail (mainline pc is dead — size and recRAMCopy
+	// bookkeeping ran on it above). The bodies outline into the cold arena
+	// below, after the hot block finalizes.
+	recEmitSideExitIslands();
+
 	pxAssert(armGetCurrentCodePointer() < SysMemory::GetEERecEnd());
 
 	// Size is from the aligned block_fnptr, not the pre-alignment recPtr —
@@ -3072,6 +3934,33 @@ StartRecomp:
 	Perf::ee.RegisterPC((void*)s_pCurBlockEx->fnptr, s_pCurBlockEx->x86size, s_pCurBlockEx->startpc);
 
 	recPtr = armEndBlock();
+
+	// SL-10: outline the side-exit bodies into the cold arena and patch the
+	// islands. Runs as its own emission session so the bodies land outside
+	// the hot compile-order stream.
+	const u8* coldDumpStart = s_coldPtr;
+	recEmitColdSideExits();
+
+	// Testing-only: YAPS2_EESB_DUMP=<hex guest pc> dumps the emitted host code
+	// (including the literal pool, post-finalize so offsets are patched) of any
+	// block whose guest range covers that pc (offline bisection aid).
+	{
+		static const u32 s_dumpPc = []() -> u32 {
+			const char* e = std::getenv("YAPS2_EESB_DUMP");
+			return e ? static_cast<u32>(std::strtoul(e, nullptr, 16)) : 0u;
+		}();
+		if (s_dumpPc && startpc <= s_dumpPc && s_dumpPc < s_nEndBlock)
+		{
+			fprintf(stderr, "EESB_DUMP: block %08x..%08x fnptr=%p size=%u endptr=%p sites=%d cold=%p+%u\n",
+				startpc, s_nEndBlock, (void*)s_pCurBlockEx->fnptr, s_pCurBlockEx->x86size,
+				(void*)recPtr, s_numContSites,
+				(void*)coldDumpStart, static_cast<u32>(s_coldPtr - coldDumpStart));
+			armDisassembleAndDumpCode((void*)s_pCurBlockEx->fnptr,
+				static_cast<size_t>((uptr)recPtr - (uptr)s_pCurBlockEx->fnptr));
+			if (s_coldPtr != coldDumpStart)
+				armDisassembleAndDumpCode(coldDumpStart, static_cast<size_t>(s_coldPtr - coldDumpStart));
+		}
+	}
 
 	pxAssert((g_cpuHasConstReg & g_cpuFlushedConstReg) == g_cpuHasConstReg);
 

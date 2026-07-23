@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
 // FPU / COP1 coverage for the EE recompiler. Single-precision only (the
@@ -35,6 +35,26 @@ struct FpuExtraOverflowGuard
 	bool saved = EmuConfig.Cpu.Recompiler.fpuExtraOverflow;
 	FpuExtraOverflowGuard() { EmuConfig.Cpu.Recompiler.fpuExtraOverflow = true; }
 	~FpuExtraOverflowGuard() { EmuConfig.Cpu.Recompiler.fpuExtraOverflow = saved; }
+};
+
+// Scoped eeClampMode selector. Sets the two Recompiler bits SetEEClampMode
+// derives from the mode: fpuOverflow (== CHECK_FPU_OVERFLOW, mode >= 1) gates
+// the result clamp and the MAX/MIN operand clamp; fpuExtraOverflow (mode >= 2)
+// gates the arithmetic operand clamp. Restores both on scope exit.
+struct FpuClampModeGuard
+{
+	bool savedO = EmuConfig.Cpu.Recompiler.fpuOverflow;
+	bool savedX = EmuConfig.Cpu.Recompiler.fpuExtraOverflow;
+	explicit FpuClampModeGuard(int mode)
+	{
+		EmuConfig.Cpu.Recompiler.fpuOverflow = (mode >= 1);
+		EmuConfig.Cpu.Recompiler.fpuExtraOverflow = (mode >= 2);
+	}
+	~FpuClampModeGuard()
+	{
+		EmuConfig.Cpu.Recompiler.fpuOverflow = savedO;
+		EmuConfig.Cpu.Recompiler.fpuExtraOverflow = savedX;
+	}
 };
 
 u32 FloatBits(float f)
@@ -459,13 +479,13 @@ TEST(EeRecFpu, SqrtSRoundsToNearestUnderChopFpcr)
 	EXPECT_EQ(h.GetFprBitsJit(2), 0x400F1BBDu); // nearest-rounded sqrt(5)
 }
 
-// ----- RSQRT.S deferred to interpreter --------------------------------
+// ----- RSQRT.S sticky flags (native) ----------------------------------
 //
 // RSQRT.S sets D|SD when the divisor Ft is zero and I|SI when Ft is negative
-// (interp RSQRT_S, FPU.cpp), and its Ft==0 branch returns ±posFmax keyed off
-// the Ft sign. The op defers to the interpreter to handle flags and the
-// zero-divisor result correctly. Assert the flag bits directly (Run() doesn't
-// diff fprc[31]).
+// (interp RSQRT_S, FPU.cpp), and its Ft==0 branch returns +/-posFmax keyed off
+// the Ft sign. The op is native (recRSQRT_S_xmm); these two cases have exact
+// results so they stay differential. Assert the flag bits directly (Run()
+// doesn't diff fprc[31]). Broad coverage lives in ee_rec_fpu_rsqrt_tests.cpp.
 TEST(EeRecFpu, RsqrtSZeroDivisorSetsDenormFlags)
 {
 	EeRecTestHarness h;
@@ -858,6 +878,93 @@ TEST(EeRecFpu, SqrtSNegativeArgumentReturnsAbsRoot)
 	h.LoadProgram({ee::SQRT_S(3, 2)});
 	h.Run();
 	h.ExpectFpr(3, FloatBits(5.0f));
+}
+
+// ----- MAX.S / MIN.S operand clamp (eeClampMode >= 1) ----------------------
+//
+// x86 recCommutativeOp clamps MAX/MIN operands (sign-preserving inf/NaN ->
+// ±fMax via fpuFloat2) whenever CHECK_FPU_OVERFLOW — the op>=2 argument makes
+// the gate always fire, so mode >= 1, a strictly LOWER threshold than ADD/SUB's
+// mode >= 2 operand clamp. AetherSX2's shipped arm64 rec gates the identical
+// clamp on fpuOverflow (options bit 8), confirmed by disassembly. Our port
+// emitted bare Fmaxnm/Fminnm with no operand clamp, so a raw Inf/NaN FPR
+// (reachable via MOV.S/LWC1/MTC1) survived as the wrong finite value — Fmaxnm/
+// Fminnm are NaN-eating and return the *other* operand — which is the True
+// Crime: New York City rainbow (a min(max(uv,0),size) UV-clamp idiom feeding a
+// corrupt palette index). These pin the x86/AetherSX2 behavior.
+//
+// The interpreter's fp_max/fp_min run on raw bits with NO operand clamp, so the
+// (correct) JIT legitimately diverges from interp here — interp is not the
+// FPU-clamp oracle, the x86 JIT is. Hence RunJitNoDiff + GetFprBitsJit rather
+// than the auto-diffing Run()/ExpectFpr.
+TEST(EeRecFpu, MaxSClampsInfOperandAtClampMode2)
+{
+	FpuClampModeGuard guard(2);
+	EeRecTestHarness h;
+	h.EnableCop1();
+	h.SetFprBits(1, 0x7F800000u); // +Inf raw bits (poisoned fpr)
+	h.SetFpr(2, 3.0f);
+	h.LoadProgram({ee::MAX_S(3, 1, 2)});
+	h.RunJitNoDiff();
+	// clamp(+Inf) = +fMax, MAX(+fMax, 3) = +fMax. Bare Fmaxnm gives +Inf.
+	EXPECT_EQ(h.GetFprBitsJit(3), 0x7F7FFFFFu);
+}
+
+TEST(EeRecFpu, MaxSClampsNanOperandToPosFmax)
+{
+	FpuClampModeGuard guard(2);
+	EeRecTestHarness h;
+	h.EnableCop1();
+	h.SetFprBits(1, 0x7FC00000u); // +NaN raw bits
+	h.SetFpr(2, -5.0f);
+	h.LoadProgram({ee::MAX_S(3, 1, 2)});
+	h.RunJitNoDiff();
+	// clamp(+NaN) = +fMax, MAX(+fMax, -5) = +fMax. Bare Fmaxnm NaN-eats -> -5.0.
+	EXPECT_EQ(h.GetFprBitsJit(3), 0x7F7FFFFFu);
+}
+
+TEST(EeRecFpu, MinSClampsNegNanOperandToNegFmax)
+{
+	FpuClampModeGuard guard(2);
+	EeRecTestHarness h;
+	h.EnableCop1();
+	h.SetFprBits(1, 0xFFC00000u); // -NaN raw bits
+	h.SetFpr(2, 5.0f);
+	h.LoadProgram({ee::MIN_S(3, 1, 2)});
+	h.RunJitNoDiff();
+	// clamp(-NaN) = -fMax, MIN(-fMax, 5) = -fMax. Bare Fminnm NaN-eats -> 5.0.
+	EXPECT_EQ(h.GetFprBitsJit(3), 0xFF7FFFFFu);
+}
+
+// The gate is fpuOverflow (mode >= 1), NOT fpuExtraOverflow (mode >= 2): the
+// clamp must still fire at mode 1. A "fix" that reused fpuClampInput (which is
+// gated on mode >= 2) would pass the mode-2 tests above but fail this one.
+TEST(EeRecFpu, MaxSClampsInfOperandAtClampMode1)
+{
+	FpuClampModeGuard guard(1);
+	EeRecTestHarness h;
+	h.EnableCop1();
+	h.SetFprBits(1, 0x7F800000u); // +Inf
+	h.SetFpr(2, 3.0f);
+	h.LoadProgram({ee::MAX_S(3, 1, 2)});
+	h.RunJitNoDiff();
+	EXPECT_EQ(h.GetFprBitsJit(3), 0x7F7FFFFFu);
+}
+
+// Lower bound: at mode 0 x86 skips the operand clamp (fpuFloat2 is a no-op when
+// !CHECK_FPU_OVERFLOW), so +Inf passes through unclamped. Guards against the fix
+// over-clamping (making the clamp unconditional). +Inf, not NaN, is used here:
+// mode-0 MAXSS-vs-Fmaxnm NaN handling is a separate pre-existing divergence.
+TEST(EeRecFpu, MaxSDoesNotClampAtClampMode0)
+{
+	FpuClampModeGuard guard(0);
+	EeRecTestHarness h;
+	h.EnableCop1();
+	h.SetFprBits(1, 0x7F800000u); // +Inf
+	h.SetFpr(2, 3.0f);
+	h.LoadProgram({ee::MAX_S(3, 1, 2)});
+	h.RunJitNoDiff();
+	EXPECT_EQ(h.GetFprBitsJit(3), 0x7F800000u); // +Inf, unclamped
 }
 
 // ===========================================================================
@@ -1417,6 +1524,107 @@ TEST(EeRecFpu, Ctc1ThenBc1BranchesOnWrittenFlag)
 	});
 	h.Run();
 	h.ExpectGpr64(reg::v0, 2ull);
+}
+
+TEST(EeRecFpu, CompareSurvivesInterposedGuardedAddCfc1)
+{
+	// GE-12 × guard-bit masking (17c4adb9e) interaction — the SotC glitch.
+	//
+	// The resident FCR31 lives in the ARM64TYPE_FPRC pool {x2-x7, x14, x15}
+	// (iCore-arm64.cpp _allocArm64GPR: x0/x1/x28 are excluded precisely
+	// because FPU/MULT emitters raw-clobber RWARG1/RWARG2). But
+	// fpuEmitGuardedAddSub raw-clobbers RWARG3 (w2) on EVERY ADD/SUB-family
+	// emit (Ubfx expd / Sub diff) and RWARG4 (w3) on the mask paths — and
+	// x2/x3 ARE in the FPRC pool. _initArm64GPRregs resets the round-robin
+	// cursor per block, so a block whose first int alloc is the FPU compare
+	// deterministically parks FCR31 in x2 → any following guarded ADD.S in
+	// the same block destroys the condition flag before BC1x/CFC1 reads it.
+	//
+	// Shape: C.LT (false → C=0, FCR31 resident) → ADD.S with |expdiff| ≥ 2
+	// (both w2 and w3 end bit-23-set: w2 = negative diff, w3 = mask
+	// 0xff..fc) → CFC1 must still read C=0.
+	//
+	// JIT-only assert: CFC1's fixed-bit emulation diverges from interp by
+	// design (see CompareThenCfc1SeesFreshConditionBit above).
+	EeRecTestHarness h;
+	h.EnableCop1();
+	h.SetFpr(1, 2.0f);
+	h.SetFpr(2, 1.0f);
+	h.SetFpr(4, 1.0f);            // exp 127
+	h.SetFpr(5, 8.0f);            // exp 130 → diff = -3 → maskS path
+	h.LoadProgram({
+		ee::C_LT_S(1, 2),         // 2 < 1 → false → C = 0; FCR31 resident (x2)
+		ee::ADD_S(3, 4, 5),       // guarded add: clobbers w2 (always) + w3 (mask path)
+		ee::CFC1(reg::v0, 31),
+	});
+	h.RunJitNoDiff();
+	EXPECT_EQ(h.GetGpr64Jit(reg::v0), 0x01000001ull); // C clear + always-one bits
+}
+
+TEST(EeRecFpu, CompareSurvivesInterposedGuardedAddBc1)
+{
+	// Same clobber as CompareSurvivesInterposedGuardedAddCfc1 but observed
+	// through the branch — the game-visible mechanism (compare → arithmetic →
+	// conditional branch is the canonical FPU idiom): C=0, an interposed
+	// guarded ADD.S leaves bit 23 set in the clobbered host reg, and BC1F
+	// (must-take on C clear) falls through instead.
+	EeRecTestHarness h;
+	h.EnableCop1();
+	h.SetFpr(1, 2.0f);
+	h.SetFpr(2, 1.0f);
+	h.SetFpr(4, 1.0f);
+	h.SetFpr(5, 8.0f);
+	h.LoadProgramNoTerm({
+		ee::C_LT_S(1, 2),         // false → C = 0
+		ee::ADD_S(3, 4, 5),       // guarded add clobber
+		ee::BC1F(3),              // C clear → must be taken
+		NOP,
+		ADDIU(reg::v0, reg::zero, 1), J(kPark), NOP, NOP,
+		ADDIU(reg::v0, reg::zero, 2), J(kPark), NOP,
+	});
+	h.Run();
+	h.ExpectGpr64(reg::v0, 2ull);
+}
+
+TEST(EeRecFpu, CompareSurvivesInterposedMult)
+{
+	// Same bug class as CompareSurvivesInterposedGuardedAddCfc1, pre-existing
+	// instance: the MULT/DIV emitters (iR5900MultDiv-arm64.cpp) raw-clobbered
+	// w2 (loadRt32 fallback) and w3 (DIV remainder / MADD LO load) — both in
+	// the FPRC pool. rt's value 0x00800000 lands bit 23 in the clobbered reg,
+	// flipping a C=0 flag to set.
+	EeRecTestHarness h;
+	h.EnableCop1();
+	h.SetFpr(1, 2.0f);
+	h.SetFpr(2, 1.0f);
+	h.SetGpr64(reg::t0, 3);
+	h.SetGpr64(reg::t1, 0x00800000ull); // bit 23 set — poison signature
+	h.LoadProgram({
+		ee::C_LT_S(1, 2),         // false → C = 0; FCR31 resident (x2)
+		MULT(reg::t0, reg::t1),   // rt materialization must not touch x2/x3
+		ee::CFC1(reg::v0, 31),
+	});
+	h.RunJitNoDiff();
+	EXPECT_EQ(h.GetGpr64Jit(reg::v0), 0x01000001ull); // C still clear
+}
+
+TEST(EeRecFpu, CompareSurvivesInterposedDiv)
+{
+	// DIV flavor: quotient/remainder of 0x00900000/0x00800001 both carry
+	// bit-23-relevant garbage through the old w2/w3 scratches.
+	EeRecTestHarness h;
+	h.EnableCop1();
+	h.SetFpr(1, 2.0f);
+	h.SetFpr(2, 1.0f);
+	h.SetGpr64(reg::t0, 0x00900000ull);
+	h.SetGpr64(reg::t1, 0x00800001ull);
+	h.LoadProgram({
+		ee::C_LT_S(1, 2),         // false → C = 0
+		DIV(reg::t0, reg::t1),
+		ee::CFC1(reg::v0, 31),
+	});
+	h.RunJitNoDiff();
+	EXPECT_EQ(h.GetGpr64Jit(reg::v0), 0x01000001ull);
 }
 
 TEST(EeRecFpu, Ctc1ThenDivByZeroAccumulatesStickyFlags)

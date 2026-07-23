@@ -490,6 +490,18 @@ enum class GSDepthFeedbackMode : u8
 	DepthAsRT = 3,
 };
 
+// GV-7 GS front/back split. Off = today's single-threaded path with no record
+// round-trip; InlineRecords = build + execute every record on the calling
+// thread (the GV7-0 shape — validation / bisect rung); Lockstep = back thread
+// runs but the front drains after every record; Pipelined = the real thing.
+enum class GSBackThreadMode : u8
+{
+	Off           = 0,
+	InlineRecords = 1,
+	Lockstep      = 2,
+	Pipelined     = 3,
+};
+
 enum class AchievementOverlayPosition : u8
 {
 	TopLeft,
@@ -662,7 +674,8 @@ struct Pcsx2Config
 		bool
 			fpuOverflow : 1,
 			fpuExtraOverflow : 1,
-			fpuFullMode : 1;
+			fpuFullMode : 1,
+			fpuGuardedAddSub : 1; // EE FPU add/sub guard-bit emulation (single-precision fast path). ON by default — the PS2-accurate behavior. Opt-OUT globally via INI for EE-FPU-heavy titles verified to render fine without it (each ADD.S/SUB.S then costs one op instead of the guard sequence). Independent of the clamp tiers: Full mode runs the DOUBLE path, which guards unconditionally regardless of this bit.
 
 		bool
 			EnableEECache : 1;
@@ -917,6 +930,7 @@ struct Pcsx2Config
 		TriFiltering TriFilter = DEFAULT_TRILINEAR_FILTERING_MODE;
 		s8 OverrideTextureBarriers = -1;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
+		GSBackThreadMode BackThreadMode = GSBackThreadMode::Off;
 
 		u8 CAS_Sharpness = 50;
 		u8 ShadeBoost_Brightness = DEFAULT_SHADEBOOST_BRIGHTNESS;
@@ -1545,6 +1559,7 @@ namespace EmuFolders
 #define CHECK_FPU_EXTRA_OVERFLOW (EmuConfig.Cpu.Recompiler.fpuExtraOverflow) // If enabled, Operands are checked for infinities before being used in the FPU recs
 #define CHECK_FPU_EXTRA_FLAGS 1 // Always enabled now // Sets D/I flags on FPU instructions
 #define CHECK_FPU_FULL (EmuConfig.Cpu.Recompiler.fpuFullMode)
+#define CHECK_FPU_GUARDED (EmuConfig.Cpu.Recompiler.fpuGuardedAddSub) // If enabled (default), add/sub emulate the PS2 FPU's missing mantissa guard bits on the single-precision fast path. Disable only for EE-heavy titles confirmed not to need it.
 
 //------------ EE Recompiler defines - Comment to disable a recompiler ---------------
 
